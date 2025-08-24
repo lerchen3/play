@@ -1,0 +1,1 @@
+attempts to use gemini to rigorize solutions.

@@ -1,0 +1,1 @@
+college contests. hmmt, omo, pumac, smt, cmimc, mp4g, etc.
