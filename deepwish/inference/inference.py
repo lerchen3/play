@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_len', type=int, default=256)
     parser.add_argument('--d_model', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--num_kv_heads', type=int, default=8, help='KV heads for GQA/NSA; must divide n_heads')
+    parser.add_argument('--use_nsa', action='store_true', help='Enable NSA (uses GQA)')
+    parser.add_argument('--window_size', type=int, default=0, help='Sliding-window size for attention kernels')
     parser.add_argument('--dc_kv', type=int, default=16)
     parser.add_argument('--dc_q', type=int, default=16)
     parser.add_argument('--num_layers', type=int, default=4)
@@ -79,6 +82,9 @@ def build_args_from_tokenizer(cli_args: argparse.Namespace, tokenizer) -> argpar
     args.mtp_depth = cli_args.mtp_depth
     args.device = torch.device(cli_args.device)
     args.d_head = cli_args.d_head
+    args.num_kv_heads = cli_args.num_kv_heads
+    args.use_nsa = cli_args.use_nsa
+    args.window_size = cli_args.window_size if cli_args.window_size > 0 else None
     return args
 
 

@@ -34,6 +34,14 @@ class DeepSeekV3Model(nn.Module):
         self.token_embed = nn.Embedding(args.vocab_size, args.d_model, padding_idx=args.pad_token_id)
         with torch.no_grad():
             self.token_embed.weight[args.pad_token_id].zero_()
+        # Extend args with NSA/GQA defaults if missing
+        if not hasattr(args, 'use_nsa'):
+            args.use_nsa = False
+        if not hasattr(args, 'num_kv_heads'):
+            # default to MHA equivalent (no grouping) unless specified
+            args.num_kv_heads = args.n_heads
+        if not hasattr(args, 'window_size'):
+            args.window_size = None
         self.layers = nn.ModuleList([TransformerBlock(args) for _ in range(args.num_layers)])
         # classifier matrix saved as [Vocab, D] to avoid transpose in loss
         self.head = nn.Parameter(torch.randn(args.vocab_size, args.d_model) / math.sqrt(args.d_model))

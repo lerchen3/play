@@ -82,6 +82,9 @@ def parse_args():
                         help='Gradient accumulation steps')
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--num_kv_heads', type=int, default=8, help='KV heads for GQA/NSA; must divide n_heads')
+    parser.add_argument('--use_nsa', action='store_true', help='Enable NSA (uses GQA)')
+    parser.add_argument('--window_size', type=int, default=0, help='Sliding-window size for attention kernels')
     parser.add_argument('--dc_kv', type=int, default=32)
     parser.add_argument('--dc_q', type=int, default=32)
     parser.add_argument('--num_layers', type=int, default=6)
@@ -213,6 +216,13 @@ def main():
         args.vocab_size = len(tokenizer)
         args.pad_token_id = tokenizer.pad_token_id
         args.device = device
+        # NSA/GQA
+        if not hasattr(args, 'use_nsa'):
+            args.use_nsa = False
+        if not hasattr(args, 'num_kv_heads'):
+            args.num_kv_heads = args.n_heads
+        if not hasattr(args, 'window_size'):
+            args.window_size = None
 
         # Only print from rank 0
         def print_rank0(*msg):

@@ -10,19 +10,29 @@ import math
 import time
 import sys
 import torch.distributed as dist
-import os
 
 # Add project root to Python path for all imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from transformers import AutoTokenizer
-from train.model import DeepSeekV3Model
 
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
 except Exception:
     MATPLOTLIB_AVAILABLE = False
+
+
+def get_model_class(architecture):
+    """Import and return the appropriate model class based on architecture"""
+    if architecture == "qwen3":
+        from train.qwen3_model import Qwen3Model
+        return Qwen3Model
+    elif architecture == "deepseekv3":
+        from train.model import DeepSeekV3Model
+        return DeepSeekV3Model
+    else:
+        raise ValueError(f"Unknown architecture: {architecture}")
 
 
 class ChatDataset(Dataset):
@@ -56,113 +66,154 @@ class ChatDataset(Dataset):
             truncation=True,
             max_length=self.seq_len,
         )
-        # encoded can be BatchEncoding or tensor depending on tokenizer
+        
+        # Handle different tokenizer return types
         if isinstance(encoded, dict) or hasattr(encoded, 'input_ids'):
             input_ids = (encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids).squeeze(0)
         else:
-            # Fallback if some tokenizer variant returns tensor directly
             input_ids = encoded.squeeze(0)
 
-        tgt_matrix = torch.zeros(self.seq_len, self.mtp_depth, dtype=torch.long)
-        for i in range(self.seq_len - 1):
-            for j in range(self.mtp_depth):
-                tgt_matrix[i, j] = input_ids[i + j + 1] if (i + j + 1) < self.seq_len else self.pad_id
-        return input_ids, tgt_matrix
+        # For MTP (Multi-Token Prediction) if using DeepSeek-V3
+        if self.mtp_depth > 0:
+            tgt_matrix = torch.zeros(self.seq_len, self.mtp_depth, dtype=torch.long)
+            for i in range(self.seq_len - 1):
+                for j in range(self.mtp_depth):
+                    tgt_matrix[i, j] = input_ids[i + j + 1] if (i + j + 1) < self.seq_len else self.pad_id
+            return input_ids, tgt_matrix
+        else:
+            return input_ids
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a DeepSeek-V3-like model with pure PyTorch.")
+    parser = argparse.ArgumentParser(description="Train models with different architectures.")
+    
+    # Architecture selection
+    parser.add_argument('--architecture', type=str, choices=['qwen3', 'deepseekv3'], required=True,
+                       help='Model architecture to use')
+    
+    # Data arguments
     parser.add_argument('--data_path', type=str, default=None, help='Path to CSV with chat data')
     parser.add_argument('--user_column', type=str, default='user', help='User column name in CSV')
     parser.add_argument('--assistant_column', type=str, default='assistant', help='Assistant column name in CSV')
+    
+    # Training arguments
     parser.add_argument('--seq_len', type=int, default=2048, help='Sequence length')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=2e-5, help='Learning rate')
-    parser.add_argument('--grad_accum_steps', type=int, default=4,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--d_model', type=int, default=512)
-    parser.add_argument('--n_heads', type=int, default=8)
-    parser.add_argument('--dc_kv', type=int, default=32)
-    parser.add_argument('--dc_q', type=int, default=32)
-    parser.add_argument('--num_layers', type=int, default=6)
-    parser.add_argument('--rmsnorm_eps', type=float, default=1e-6)
-    parser.add_argument('--n_shared_experts', type=int, default=1)
-    parser.add_argument('--n_routed_experts', type=int, default=4)
-    parser.add_argument('--k_routed_experts', type=int, default=1)
-    parser.add_argument('--d_ff_expert_mult', type=int, default=2)
-    parser.add_argument('--moe_balance_factor', type=float, default=0.01)
-    parser.add_argument('--bias_update_speed', type=float, default=0.001)
-    parser.add_argument('--mtp_depth', type=int, default=0, help='Number of future tokens per position')
-    parser.add_argument('--mtp_weight', type=float, default=0.5, help='Weight for MTP loss')
-    parser.add_argument('--model_checkpoint', type=str, default=None,
-                        help='Path to model checkpoint for resuming training (model weights only)')
-    parser.add_argument('--resume_checkpoint', type=str, default=None,
-                        help='Path to full training checkpoint for resuming (includes optimizer, scheduler, metrics)')
-    parser.add_argument('--checkpoint_save_path', type=str, default=None,
-                        help='Path to save training checkpoint (model + optimizer + epoch)')
-    parser.add_argument('--model_save_path', type=str, default=None,
-                        help='Path to save final model (for inference.py)')
-    parser.add_argument('--val_split', type=float, default=0.1,
-                        help='Fraction of dataset for validation')
-    parser.add_argument('--eval_interval', type=int, default=100,
-                        help='Run evaluation every N training steps')
-    parser.add_argument('--d_head', type=int, default=None,
-                        help='Override the attention head dimension (default d_model/n_heads)')
-    parser.add_argument('--time_limit', type=int, default=11*3600+30*60,
-                        help='Hard training time limit in seconds before checkpoint+exit')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
-                        help='Weight decay for AdamW')
-    parser.add_argument('--lr_warmup_steps', type=int, default=1000,
-                        help='Steps to linearly warm up the learning rate')
-    parser.add_argument('--lr_decay_steps', type=int, default=10000,
-                        help='Total steps for linear LR decay after warmup')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
-                        help='Directory to save step checkpoints/metrics')
+    parser.add_argument('--grad_accum_steps', type=int, default=4, help='Gradient accumulation steps')
+    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay for AdamW')
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping')
-    parser.add_argument('--ema_decay', type=float, default=0.9, help='Decay factor for exponential moving average of losses')
+    
+    # Common model arguments
+    parser.add_argument('--d_model', type=int, help='Model hidden dimension (default varies by arch)')
+    parser.add_argument('--num_layers', type=int, help='Number of transformer layers (default varies by arch)')
+    parser.add_argument('--rmsnorm_eps', type=float, default=1e-6, help='RMSNorm epsilon')
+    
+    # Qwen3-specific arguments
+    parser.add_argument('--n_q_heads', type=int, help='Number of query heads (Qwen3)')
+    parser.add_argument('--n_kv_heads', type=int, help='Number of key-value heads (Qwen3, GQA)')
+    parser.add_argument('--d_ff', type=int, help='Feed-forward dimension (Qwen3)')
+    
+    # DeepSeek-V3 specific arguments  
+    parser.add_argument('--n_heads', type=int, help='Number of attention heads (DeepSeekV3)')
+    parser.add_argument('--dc_kv', type=int, help='Key-value compression dimension (DeepSeekV3 MLA)')
+    parser.add_argument('--dc_q', type=int, help='Query compression dimension (DeepSeekV3 MLA)')
+    parser.add_argument('--d_head', type=int, help='Attention head dimension override')
+    parser.add_argument('--n_shared_experts', type=int, help='Number of shared experts (DeepSeekV3 MoE)')
+    parser.add_argument('--n_routed_experts', type=int, help='Number of routed experts (DeepSeekV3 MoE)')
+    parser.add_argument('--k_routed_experts', type=int, help='Number of active routed experts (DeepSeekV3 MoE)')
+    parser.add_argument('--d_ff_expert_mult', type=int, help='Expert FFN dimension multiplier (DeepSeekV3)')
+    parser.add_argument('--moe_balance_factor', type=float, help='MoE load balancing factor (DeepSeekV3)')
+    parser.add_argument('--bias_update_speed', type=float, help='MoE bias update speed (DeepSeekV3)')
+    parser.add_argument('--mtp_depth', type=int, default=0, help='Multi-token prediction depth (DeepSeekV3)')
+    parser.add_argument('--mtp_weight', type=float, default=0.5, help='Weight for MTP loss (DeepSeekV3)')
+    
+    # Optimizer arguments
     parser.add_argument('--adam_beta1', type=float, default=0.9, help='Adam beta1')
     parser.add_argument('--adam_beta2', type=float, default=0.999, help='Adam beta2')
     parser.add_argument('--adam_eps', type=float, default=1e-8, help='Adam epsilon')
+    
+    # Learning rate schedule
+    parser.add_argument('--lr_warmup_steps', type=int, default=1000, help='LR warmup steps')
+    parser.add_argument('--lr_decay_steps', type=int, default=10000, help='LR decay steps')
+    
+    # Checkpointing and evaluation
+    parser.add_argument('--model_checkpoint', type=str, default=None, help='Model checkpoint path for resuming')
+    parser.add_argument('--resume_checkpoint', type=str, default=None, help='Full training checkpoint path')
+    parser.add_argument('--checkpoint_save_path', type=str, default=None, help='Path to save checkpoints')
+    parser.add_argument('--model_save_path', type=str, default=None, help='Path to save final model')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Checkpoint directory')
+    parser.add_argument('--val_split', type=float, default=0.1, help='Validation split fraction')
+    parser.add_argument('--eval_interval', type=int, default=100, help='Evaluation interval in steps')
+    
+    # Misc
+    parser.add_argument('--time_limit', type=int, default=11*3600+30*60, help='Training time limit in seconds')
+    parser.add_argument('--ema_decay', type=float, default=0.9, help='EMA decay for loss tracking')
+    
     args = parser.parse_args()
-    args.d_ff_expert = args.d_model * args.d_ff_expert_mult
+    
+    # Set architecture-specific defaults
+    if args.architecture == "qwen3":
+        args.d_model = args.d_model or 1024
+        args.num_layers = args.num_layers or 28
+        args.n_q_heads = args.n_q_heads or 16
+        args.n_kv_heads = args.n_kv_heads or 8
+        args.d_ff = args.d_ff or 3072
+    elif args.architecture == "deepseekv3":
+        args.d_model = args.d_model or 512
+        args.num_layers = args.num_layers or 6
+        args.n_heads = args.n_heads or 8
+        args.dc_kv = args.dc_kv or 32
+        args.dc_q = args.dc_q or 32
+        args.n_shared_experts = args.n_shared_experts or 1
+        args.n_routed_experts = args.n_routed_experts or 4
+        args.k_routed_experts = args.k_routed_experts or 1
+        args.d_ff_expert_mult = args.d_ff_expert_mult or 2
+        args.moe_balance_factor = args.moe_balance_factor or 0.01
+        args.bias_update_speed = args.bias_update_speed or 0.001
+        args.d_ff_expert = args.d_model * args.d_ff_expert_mult
+    
     return args
 
 
 def evaluate(model, loader, device, args):
+    """Evaluate the model on validation data"""
     model.eval()
-    total = 0.0
+    total_loss = 0.0
     count = 0
+    
     if loader is None:
         return float('nan')
+        
     with torch.no_grad():
-        for inp, tgt_matrix in loader:
-            inp = inp.to(device)
-            tgt_matrix = tgt_matrix.to(device)
-            # unwrap DDP to access the real model
-            real_model = model.module if hasattr(model, 'module') else model
-            # prepare next-token targets
-            target_main = torch.roll(inp, shifts=-1, dims=1)
-            target_main[:, -1] = args.pad_token_id
-            # forward with loss computation
-            losses = real_model(
-                inp,
-                target_main=target_main,
-                tgt_matrix=tgt_matrix,
-                is_training=False
-            )
-            loss_main, loss_mtp = losses[0], losses[1]
-            # ensure tensors
-            if loss_main is None:
-                loss_main = torch.tensor(0.0, device=device)
-            if loss_mtp is None:
-                loss_mtp = torch.tensor(0.0, device=device)
-            loss = loss_main + args.mtp_weight * loss_mtp
-            total += loss.item()
+        for batch in loader:
+            if args.architecture == "deepseekv3" and args.mtp_depth > 0:
+                input_ids, tgt_matrix = batch
+                input_ids = input_ids.to(device)
+                tgt_matrix = tgt_matrix.to(device)
+                
+                # Get model (unwrap DDP if needed)
+                real_model = model.module if hasattr(model, 'module') else model
+                target_main = torch.roll(input_ids, shifts=-1, dims=1)
+                target_main[:, -1] = args.pad_token_id
+                
+                losses = real_model(input_ids, target_main=target_main, tgt_matrix=tgt_matrix, is_training=False)
+                loss_main, loss_mtp = losses[0], losses[1]
+                loss = loss_main + args.mtp_weight * loss_mtp
+            else:
+                input_ids = batch if not isinstance(batch, (list, tuple)) else batch[0]
+                input_ids = input_ids.to(device)
+                target_main = torch.roll(input_ids, shifts=-1, dims=1)
+                target_main[:, -1] = args.pad_token_id
+                
+                loss = model(input_ids, target_main=target_main, is_training=True)
+                
+            total_loss += loss.item()
             count += 1
+            
     model.train()
-    avg_loss = total / max(1, count)
-    return avg_loss
+    return total_loss / max(1, count)
 
 
 def setup_distributed():
@@ -172,13 +223,11 @@ def setup_distributed():
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         
-        # Initialize process group
         dist.init_process_group(backend='nccl')
         torch.cuda.set_device(local_rank)
         
         return rank, world_size, local_rank
     else:
-        # Single GPU mode
         return 0, 1, 0
 
 
@@ -187,20 +236,19 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-    
+
 def main():
     # Initialize distributed training
     rank, world_size, local_rank = setup_distributed()
-    device = torch.device(f'cuda:{local_rank}')
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     
-    print(f"[RANK {rank}] Starting main function...", flush=True)
+    print(f"[RANK {rank}] Starting training on device: {device}", flush=True)
     
     try:
         args = parse_args()
-        print(f"[RANK {rank}] Args parsed successfully", flush=True)
         
-        # Initialize tokenizer (local path)
-        print(f"[RANK {rank}] Loading tokenizer from local Qwen path...", flush=True)
+        # Initialize tokenizer
+        print(f"[RANK {rank}] Loading tokenizer...", flush=True)
         tokenizer = AutoTokenizer.from_pretrained("/kaggle/input/qwen-3/transformers/0.6b/1")
 
         # Ensure pad token exists
@@ -210,452 +258,219 @@ def main():
             else:
                 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-        # Use total length, not vocab_size (accounts for added/special tokens)
+        # Set model parameters
         args.vocab_size = len(tokenizer)
         args.pad_token_id = tokenizer.pad_token_id
         args.device = device
-
-        # Only print from rank 0
+        
         def print_rank0(*msg):
             if rank == 0:
                 print(*msg)
 
-        print_rank0(f"Starting training with {world_size} GPUs")
-        print_rank0(f"Data path: {args.data_path}")
+        print_rank0(f"Starting {args.architecture} training with {world_size} GPUs")
         print_rank0(f"Vocab size: {args.vocab_size}")
-        print_rank0(f"Pad token ID: {args.pad_token_id}")
+        print_rank0(f"Sequence length: {args.seq_len}")
 
-        # Load data
-        print_rank0("Loading dataset...")
-        df = pd.read_csv(args.data_path)
-        users = df[args.user_column].tolist() if args.user_column in df.columns else [""] * len(df)
-        assistants = df[args.assistant_column].tolist() if args.assistant_column in df.columns else [""] * len(df)
-        # Split data
-        split_idx = int(len(users) * (1.0 - args.val_split))
-        train_users, val_users = users[:split_idx], users[split_idx:]
-        train_assistants, val_assistants = assistants[:split_idx], assistants[split_idx:]
-        print_rank0(f"Dataset split: {len(train_users)} train, {len(val_users)} val")
+        # Load and split data
+        if args.data_path:
+            print_rank0("Loading dataset...")
+            df = pd.read_csv(args.data_path)
+            users = df[args.user_column].tolist() if args.user_column in df.columns else [""] * len(df)
+            assistants = df[args.assistant_column].tolist() if args.assistant_column in df.columns else [""] * len(df)
+            
+            # Split data
+            split_idx = int(len(users) * (1.0 - args.val_split))
+            train_users, val_users = users[:split_idx], users[split_idx:]
+            train_assistants, val_assistants = assistants[:split_idx], assistants[split_idx:]
+            print_rank0(f"Dataset split: {len(train_users)} train, {len(val_users)} val")
+            
+            # Create datasets
+            mtp_depth = args.mtp_depth if args.architecture == "deepseekv3" else 0
+            train_dataset = ChatDataset(train_users, train_assistants, tokenizer, args.seq_len, mtp_depth)
+            val_dataset = ChatDataset(val_users, val_assistants, tokenizer, args.seq_len, mtp_depth) if val_users else None
+            
+            # Create DataLoaders
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False) if val_dataset else None
+        else:
+            print_rank0("No data path provided - creating dummy data for testing")
+            dummy_users = ["Hello", "How are you?", "What's the weather?"] * 20
+            dummy_assistants = ["Hi there!", "I'm doing well!", "It's sunny today!"] * 20
+            mtp_depth = args.mtp_depth if args.architecture == "deepseekv3" else 0
+            train_dataset = ChatDataset(dummy_users, dummy_assistants, tokenizer, args.seq_len, mtp_depth)
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+            val_loader = None
 
-        # Create datasets
-        train_dataset = ChatDataset(train_users, train_assistants, tokenizer, args.seq_len, args.mtp_depth)
-        val_dataset = ChatDataset(val_users, val_assistants, tokenizer, args.seq_len, args.mtp_depth) if val_users else None
+        # Create model
+        print_rank0(f"Creating {args.architecture} model...")
+        ModelClass = get_model_class(args.architecture)
+        model = ModelClass(args).to(device)
+        total_params = sum(p.numel() for p in model.parameters())
+        print_rank0(f"Model created with {total_params:,} parameters ({total_params/1e6:.1f}M)")
 
-        # Create DataLoaders
-        print_rank0("Creating data loaders...")
-        loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False) if val_dataset else None
-        print_rank0("Data loaders created")
-
-        # Initialize training state variables
-        start_epoch = 0
-        start_global_step = 1
-        resume_ema_loss = None
-        resume_ema_loss_main = None 
-        resume_ema_loss_mtp = None
-        resume_ema_bal_loss = None
-        resume_ema_param_norm = None
-        resume_ema_grad_norm = None
-        resume_ema_tokens_per_sec = None
-        resume_ema_eval_loss = None
-        resume_cum_loss = 0.0
-        resume_cum_loss_main = 0.0
-        resume_cum_loss_mtp = 0.0
-
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-        # Only keep one checkpoint and one metrics file on disk
-        ckpt_path = args.checkpoint_save_path or os.path.join(args.checkpoint_dir, 'latest_checkpoint.pt')
-        metrics_csv_path = os.path.join(args.checkpoint_dir, 'metrics.csv')
-
-        metrics = []
-        global_step = start_global_step
-        cum_loss = resume_cum_loss
-        cum_loss_main = resume_cum_loss_main
-        cum_loss_mtp = resume_cum_loss_mtp
-        ema_loss = resume_ema_loss
-        ema_loss_main = resume_ema_loss_main
-        ema_loss_mtp = resume_ema_loss_mtp
-        ema_bal_loss = resume_ema_bal_loss
-        ema_param_norm = resume_ema_param_norm
-        ema_grad_norm = resume_ema_grad_norm
-        ema_tokens_per_sec = resume_ema_tokens_per_sec
-        ema_eval_loss = resume_ema_eval_loss
-        decay = args.ema_decay
-
-        print_rank0("Creating model...")
-        model = DeepSeekV3Model(args).to(device)
-        print_rank0("Model created and moved to device")
-
-        # Load model-only checkpoint if requested (just weights)
+        # Load model checkpoint if provided
         if args.model_checkpoint and os.path.isfile(args.model_checkpoint):
             print_rank0(f"Loading model weights from {args.model_checkpoint}")
             ckpt = torch.load(args.model_checkpoint, map_location=device)
             state_dict = ckpt.get('model_state_dict', ckpt)
-            # Allow seq_len changes: drop RoPE buffers and load non-strict
-            keys_to_drop = [k for k in list(state_dict.keys()) if (
-                '.attn.rope_k.cos' in k or '.attn.rope_k.sin' in k or '.attn.rope_q.cos' in k or '.attn.rope_q.sin' in k
-            )]
-            for k in keys_to_drop:
-                state_dict.pop(k, None)
-            res = model.load_state_dict(state_dict, strict=False)
-            print_rank0(f"Model weights loaded (non-strict). Missing: {len(res.missing_keys)}, Unexpected: {len(res.unexpected_keys)}")
+            model.load_state_dict(state_dict, strict=False)
+            print_rank0("Model weights loaded")
 
-        # Wrap model with DistributedDataParallel if multi-GPU
+        # Wrap model with DDP if multi-GPU
         if world_size > 1:
             print_rank0("Wrapping model with DistributedDataParallel...")
             model = torch.nn.parallel.DistributedDataParallel(
-                model, 
+                model,
                 device_ids=[local_rank],
                 find_unused_parameters=True
             )
-            print_rank0("DDP wrapper applied")
 
         # Create optimizer and scheduler
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
-                               betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+        optimizer = optim.AdamW(
+            model.parameters(), 
+            lr=args.lr, 
+            weight_decay=args.weight_decay,
+            betas=(args.adam_beta1, args.adam_beta2), 
+            eps=args.adam_eps
+        )
         
         def lr_lambda(step):
             if step < args.lr_warmup_steps:
                 return float(step) / float(max(1, args.lr_warmup_steps))
             decay_steps = max(1, args.lr_decay_steps - args.lr_warmup_steps)
             return max(0.0, float(args.lr_decay_steps - step) / decay_steps)
+        
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        # Load full training checkpoint if requested (complete state)
-        if args.resume_checkpoint and os.path.isfile(args.resume_checkpoint):
-            print_rank0(f"Resuming training from full checkpoint: {args.resume_checkpoint}")
-            ckpt = torch.load(args.resume_checkpoint, map_location=device)
-            
-            # Load model state (allow seq_len changes by skipping RoPE buffers)
-            model_state_dict = ckpt['model_state_dict']
-            keys_to_drop = [k for k in list(model_state_dict.keys()) if (
-                '.attn.rope_k.cos' in k or '.attn.rope_k.sin' in k or '.attn.rope_q.cos' in k or '.attn.rope_q.sin' in k
-            )]
-            for k in keys_to_drop:
-                model_state_dict.pop(k, None)
-            target_model = model.module if hasattr(model, 'module') else model
-            res = target_model.load_state_dict(model_state_dict, strict=False)
-            print_rank0(f"Model state loaded (non-strict). Missing: {len(res.missing_keys)}, Unexpected: {len(res.unexpected_keys)}")
-            
-            # Load optimizer state
-            if 'optimizer_state_dict' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                print_rank0("Optimizer state loaded from checkpoint")
-            
-            # Load scheduler state
-            if 'scheduler_state_dict' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-                print_rank0("Scheduler state loaded from checkpoint")
-            
-            # Load training progress
-            start_global_step = ckpt.get('global_step', 1)
-            start_epoch = ckpt.get('epoch', 0)
-            
-            # Load EMA values
-            resume_ema_loss = ckpt.get('ema_loss')
-            resume_ema_loss_main = ckpt.get('ema_loss_main')
-            resume_ema_loss_mtp = ckpt.get('ema_loss_mtp')
-            resume_ema_bal_loss = ckpt.get('ema_bal_loss')
-            resume_ema_param_norm = ckpt.get('ema_param_norm')
-            resume_ema_grad_norm = ckpt.get('ema_grad_norm')
-            resume_ema_tokens_per_sec = ckpt.get('ema_tokens_per_sec')
-            resume_ema_eval_loss = ckpt.get('ema_eval_loss')
-            
-            # Load cumulative losses
-            resume_cum_loss = ckpt.get('cum_loss', 0.0)
-            resume_cum_loss_main = ckpt.get('cum_loss_main', 0.0)
-            resume_cum_loss_mtp = ckpt.get('cum_loss_mtp', 0.0)
-            
-            print_rank0(f"Resumed from epoch {start_epoch}, global step {start_global_step}")
-
-        print_rank0("Optimizer and scheduler created")
-
-        # Hard time limit
-        TIME_LIMIT = args.time_limit
+        # Training state
+        global_step = 1
         start_time = time.time()
-        time_exceeded = False
-
-        print_rank0(f"Starting training epochs from epoch {start_epoch}...")
-        for epoch in range(start_epoch, args.epochs):
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        
+        # Metrics tracking
+        metrics = []
+        ema_loss = None
+        cum_loss = 0.0
+        
+        print_rank0("Starting training...")
+        for epoch in range(args.epochs):
             print_rank0(f"=== EPOCH {epoch+1}/{args.epochs} ===")
             model.train()
-            total_loss = 0.0
+            epoch_loss = 0.0
             optimizer.zero_grad()
             
-            print_rank0(f"Starting iteration over data loader...")
-            batch_count = 0
-            for batch_idx, (inp, tgt_matrix) in enumerate(loader):
-                batch_count += 1
-                if batch_count == 1:
-                    print_rank0(f"Processing first batch: {inp.shape}")
-                elif batch_count % 10 == 0:
-                    print_rank0(f"Processed {batch_count} batches")
-                    
-                step_start = time.time()
-                # Check for time expiry
-                if time.time() - start_time > TIME_LIMIT:
-                    print_rank0(f"Time limit reached at Epoch {epoch+1}, Step {batch_idx+1}. Saving checkpoint.")
-                    if rank == 0:  # Only save from rank 0
-                        ckpt = {
-                            'epoch': epoch + 1,
-                            'batch_idx': batch_idx + 1,
+            for batch_idx, batch in enumerate(train_loader):
+                # Check time limit
+                if time.time() - start_time > args.time_limit:
+                    print_rank0(f"Time limit reached. Saving checkpoint...")
+                    if rank == 0 and args.checkpoint_save_path:
+                        torch.save({
+                            'epoch': epoch,
                             'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                            'global_step': global_step,
                             'scheduler_state_dict': scheduler.state_dict(),
-                            'ema_loss': ema_loss,
-                            'ema_loss_main': ema_loss_main,
-                            'ema_loss_mtp': ema_loss_mtp,
-                            'ema_bal_loss': ema_bal_loss,
-                            'ema_param_norm': ema_param_norm,
-                            'ema_grad_norm': ema_grad_norm,
-                            'ema_tokens_per_sec': ema_tokens_per_sec,
-                            'ema_eval_loss': ema_eval_loss,
-                            'cum_loss': cum_loss,
-                            'cum_loss_main': cum_loss_main,
-                            'cum_loss_mtp': cum_loss_mtp
-                        }
-                        torch.save(ckpt, ckpt_path)
-                        print_rank0(f"Checkpoint saved to {ckpt_path}")
-                    time_exceeded = True
-                    break
-
-                inp = inp.to(device)
-                tgt_matrix = tgt_matrix.to(device)
-
-                real_model = model.module if hasattr(model, 'module') else model
-                target_main = torch.roll(inp, shifts=-1, dims=1)
-                target_main[:, -1] = args.pad_token_id
-
-                # Standard forward pass
-                losses = real_model(
-                    inp,
-                    target_main=target_main,
-                    tgt_matrix=tgt_matrix,
-                    is_training=True
-                )
-                loss_main, loss_mtp = losses[0], losses[1]
-                step_loss = loss_main + args.mtp_weight * loss_mtp
-                loss = step_loss / args.grad_accum_steps
-                loss.backward()
+                            'global_step': global_step,
+                        }, args.checkpoint_save_path)
+                        print_rank0(f"Checkpoint saved")
+                    return
+                
+                # Handle different architectures
+                if args.architecture == "deepseekv3" and args.mtp_depth > 0:
+                    input_ids, tgt_matrix = batch
+                    input_ids = input_ids.to(device)
+                    tgt_matrix = tgt_matrix.to(device)
                     
+                    # Get model (unwrap DDP if needed)
+                    real_model = model.module if hasattr(model, 'module') else model
+                    target_main = torch.roll(input_ids, shifts=-1, dims=1)
+                    target_main[:, -1] = args.pad_token_id
+                    
+                    losses = real_model(input_ids, target_main=target_main, tgt_matrix=tgt_matrix, is_training=True)
+                    loss_main, loss_mtp = losses[0], losses[1]
+                    loss = loss_main + args.mtp_weight * loss_mtp
+                else:
+                    input_ids = batch if not isinstance(batch, (list, tuple)) else batch[0]
+                    input_ids = input_ids.to(device)
+                    target_main = torch.roll(input_ids, shifts=-1, dims=1)
+                    target_main[:, -1] = args.pad_token_id
+                    
+                    real_model = model.module if hasattr(model, 'module') else model
+                    loss = real_model(input_ids, target_main=target_main, is_training=True)
+                
+                loss = loss / args.grad_accum_steps
+                loss.backward()
+                
+                # Update on accumulation steps
                 if (batch_idx + 1) % args.grad_accum_steps == 0:
-                    # Clip gradients and do the real update
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
-
-                    # Now bump the real step counter
                     global_step += 1
-
-                    # update routing biases for load balancing
-                    real_model = model.module if hasattr(model, 'module') else model
-                    for layer in real_model.layers:
-                        if hasattr(layer, 'moe'):
-                            layer.moe.update_biases(args.bias_update_speed)
-
-                # Update counters
-                step_time = time.time() - step_start
-                tokens_per_sec = inp.numel() / step_time if step_time > 0 else float('inf')
-
-                cum_loss += step_loss.item()
-                cum_loss_main += loss_main.item()
-                cum_loss_mtp += (loss_mtp.item() if isinstance(loss_mtp, torch.Tensor) else float(loss_mtp))
-
-                # Calculate expert usage balance loss
-                all_counts = torch.zeros(args.n_routed_experts, device=device)
-                # Handle DistributedDataParallel by accessing underlying module if wrapped
-                real_model = model.module if hasattr(model, 'module') else model
-                for layer in real_model.layers:
-                    # Use the accumulated expert usage from MoE call
-                    if layer.total_expert_usage is not None:
-                        all_counts += layer.total_expert_usage.to(device).float()
-                uniform_count = all_counts.sum() / args.n_routed_experts
-                bal_loss = torch.abs(all_counts - uniform_count).mean()
                     
-                # Calculate parameter norm (use unwrapped model for parameters)
-                param_norm = 0.0
-                for p in real_model.parameters():
-                    param_norm += p.data.pow(2).sum().item()
-                param_norm = math.sqrt(param_norm)
-
-                # Calculate gradient norm (use model for gradients)
-                grad_norm = 0.0
-                if any(p.grad is not None for p in model.parameters()):
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            grad_norm += p.grad.data.pow(2).sum().item()
-                    grad_norm = math.sqrt(grad_norm)
-
-                # Update EMAs
-                if ema_loss is None:
-                    ema_loss = step_loss.item()
-                    ema_loss_main = loss_main.item()
-                    ema_loss_mtp = loss_mtp.item() if isinstance(loss_mtp, torch.Tensor) else float(loss_mtp)
-                    ema_bal_loss = bal_loss.item()
-                    ema_param_norm = param_norm
-                    ema_grad_norm = grad_norm
-                    ema_tokens_per_sec = tokens_per_sec
-                else:
-                    ema_loss = decay * ema_loss + (1 - decay) * step_loss.item()
-                    ema_loss_main = decay * ema_loss_main + (1 - decay) * loss_main.item()
-                    ema_loss_mtp = decay * ema_loss_mtp + (1 - decay) * (loss_mtp.item() if isinstance(loss_mtp, torch.Tensor) else float(loss_mtp))
-                    ema_bal_loss = decay * ema_bal_loss + (1 - decay) * bal_loss.item()
-                    ema_param_norm = decay * ema_param_norm + (1 - decay) * param_norm
-                    ema_grad_norm = decay * ema_grad_norm + (1 - decay) * grad_norm
-                    ema_tokens_per_sec = decay * ema_tokens_per_sec + (1 - decay) * tokens_per_sec
-
-                # Record metrics (only on rank 0 and when we're doing updates)
-                if rank == 0 and (batch_idx + 1) % args.grad_accum_steps == 0:
-                    metrics.append({
-                        'step': global_step,
-                        'loss': step_loss.item(),
-                        'loss_main': loss_main.item(),
-                        'loss_mtp': loss_mtp.item() if isinstance(loss_mtp, torch.Tensor) else float(loss_mtp),
-                        'bal_loss': bal_loss.item(),
-                        'avg_loss': cum_loss / global_step,
-                        'avg_loss_main': cum_loss_main / global_step,
-                        'avg_loss_mtp': cum_loss_mtp / global_step,
-                        'ema_loss': ema_loss,
-                        'ema_loss_main': ema_loss_main,
-                        'ema_loss_mtp': ema_loss_mtp,
-                        'ema_bal_loss': ema_bal_loss,
-                        'param_norm': param_norm,
-                        'grad_norm': grad_norm,
-                        'lr': scheduler.get_last_lr()[0],
-                        'step_time': step_time,
-                        'tokens_per_sec': tokens_per_sec,
-                        'eval_loss': None,
-                        'ema_param_norm': ema_param_norm,
-                        'ema_grad_norm': ema_grad_norm,
-                        'ema_tokens_per_sec': ema_tokens_per_sec,
-                        'ema_eval_loss': ema_eval_loss,
-                    })
-
-                total_loss += step_loss.item()
-                if (batch_idx + 1) % args.grad_accum_steps == 0:
+                    # Update routing biases for DeepSeekV3 MoE
+                    if args.architecture == "deepseekv3":
+                        real_model = model.module if hasattr(model, 'module') else model
+                        for layer in real_model.layers:
+                            if hasattr(layer, 'moe'):
+                                layer.moe.update_biases(args.bias_update_speed)
+                    
+                    # Update metrics
+                    step_loss = loss.item() * args.grad_accum_steps
+                    epoch_loss += step_loss
+                    cum_loss += step_loss
+                    
+                    if ema_loss is None:
+                        ema_loss = step_loss
+                    else:
+                        ema_loss = args.ema_decay * ema_loss + (1 - args.ema_decay) * step_loss
+                    
+                    # Record metrics
+                    if rank == 0:
+                        metrics.append({
+                            'step': global_step,
+                            'epoch': epoch + 1,
+                            'loss': step_loss,
+                            'avg_loss': cum_loss / global_step,
+                            'ema_loss': ema_loss,
+                            'lr': scheduler.get_last_lr()[0],
+                        })
+                    
+                    # Logging
                     if global_step % 10 == 0:
-                        avg = total_loss / global_step
-                        print_rank0(f"Epoch {epoch+1}/{args.epochs}, Step {global_step}, Avg Loss: {avg:.4f}")
-
-                    # Print peak GPU memory after first 10 steps
-                    if global_step == 10:
-                        peak_memory = torch.cuda.max_memory_allocated(device) / (1024**3)  # Convert to GB
-                        print_rank0(f"Peak GPU Memory after 10 steps: {peak_memory:.2f} GB")
-
+                        avg_loss = cum_loss / global_step
+                        print_rank0(f"Epoch {epoch+1}, Step {global_step}, Loss: {step_loss:.4f}, Avg: {avg_loss:.4f}, EMA: {ema_loss:.4f}")
+                    
+                    # Evaluation
                     if global_step % args.eval_interval == 0 and val_loader is not None:
                         eval_loss = evaluate(model, val_loader, device, args)
-                        if rank == 0:
+                        print_rank0(f"Validation loss at step {global_step}: {eval_loss:.4f}")
+                        if rank == 0 and metrics:
                             metrics[-1]['eval_loss'] = eval_loss
-                            # Update EMA for eval_loss
-                            if ema_eval_loss is None:
-                                ema_eval_loss = eval_loss
-                            else:
-                                ema_eval_loss = decay * ema_eval_loss + (1 - decay) * eval_loss
-                            metrics[-1]['ema_eval_loss'] = ema_eval_loss
-                        print_rank0(f"Eval loss after {global_step} steps: {eval_loss:.4f}")
-
-                    if global_step % 100 == 0 and rank == 0:
+                    
+                    # Save checkpoint periodically
+                    if global_step % 100 == 0 and rank == 0 and args.checkpoint_save_path:
                         ckpt = {
-                            'step': global_step,
                             'epoch': epoch,
                             'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict(),
                             'global_step': global_step,
                             'ema_loss': ema_loss,
-                            'ema_loss_main': ema_loss_main,
-                            'ema_loss_mtp': ema_loss_mtp,
-                            'ema_bal_loss': ema_bal_loss,
-                            'ema_param_norm': ema_param_norm,
-                            'ema_grad_norm': ema_grad_norm,
-                            'ema_tokens_per_sec': ema_tokens_per_sec,
-                            'ema_eval_loss': ema_eval_loss,
                             'cum_loss': cum_loss,
-                            'cum_loss_main': cum_loss_main,
-                            'cum_loss_mtp': cum_loss_mtp
                         }
+                        torch.save(ckpt, args.checkpoint_save_path)
                         
-                        # overwrite single checkpoint
-                        torch.save(ckpt, ckpt_path)
-                        # overwrite metrics.csv
-                        pd.DataFrame(metrics).to_csv(metrics_csv_path, index=False)
-                        
-                        # Create individual plots for each metric
-                        if MATPLOTLIB_AVAILABLE:
-                            steps = [m['step'] for m in metrics]
-                            
-                            # Get all metric keys except 'step' (which is our x-axis)
-                            metric_keys = set()
-                            for metric_dict in metrics:
-                                metric_keys.update(metric_dict.keys())
-                            metric_keys.discard('step')  # Remove 'step' since it's the x-axis
-                            
-                            # Create individual plot for each metric
-                            for metric_name in sorted(metric_keys):
-                                # Check if this metric exists in all entries (some metrics like eval_loss are sparse)
-                                metric_values = []
-                                metric_steps = []
-                                for i, m in enumerate(metrics):
-                                    if metric_name in m and m[metric_name] is not None:
-                                        metric_values.append(m[metric_name])
-                                        metric_steps.append(m['step'])
-                                
-                                if metric_values:  # Only plot if we have data
-                                    plt.figure(figsize=(10, 6))
-                                    plt.plot(metric_steps, metric_values, label=metric_name, marker='o' if len(metric_values) < 50 else None)
-                                    plt.xlabel('step')
-                                    plt.ylabel(metric_name)
-                                    plt.title(f'{metric_name.replace("_", " ").title()} vs Step')
-                                    plt.grid(True, alpha=0.3)
-                                    plt.legend()
-                                    plt.tight_layout()
-                                    
-                                    # Save each plot with the metric name
-                                    plot_path = os.path.join(args.checkpoint_dir, f'{metric_name}.png')
-                                    plt.savefig(plot_path)
-                                    plt.close()
+                        # Save metrics
+                        if metrics:
+                            metrics_path = os.path.join(args.checkpoint_dir, 'metrics.csv')
+                            pd.DataFrame(metrics).to_csv(metrics_path, index=False)
 
-            if time_exceeded:
-                break
+            # End of epoch
+            avg_epoch_loss = epoch_loss / (len(train_loader) // args.grad_accum_steps)
+            print_rank0(f"End of epoch {epoch+1}, Average loss: {avg_epoch_loss:.4f}")
 
-            # End of epoch logging
-            print_rank0(f"End Epoch {epoch+1}, Avg Loss: {total_loss/(global_step):.4f}")
-            if val_loader is not None:
-                epoch_eval = evaluate(model, val_loader, device, args)
-                print_rank0(f"Epoch {epoch+1} Validation Loss: {epoch_eval:.4f}")
-
-            # overwrite single checkpoint at end of epoch (only rank 0)
-            if rank == 0:
-                ckpt = {
-                    'epoch': epoch+1,
-                    'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'global_step': global_step,
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'ema_loss': ema_loss,
-                    'ema_loss_main': ema_loss_main,
-                    'ema_loss_mtp': ema_loss_mtp,
-                    'ema_bal_loss': ema_bal_loss,
-                    'ema_param_norm': ema_param_norm,
-                    'ema_grad_norm': ema_grad_norm,
-                    'ema_tokens_per_sec': ema_tokens_per_sec,
-                    'ema_eval_loss': ema_eval_loss,
-                    'cum_loss': cum_loss,
-                    'cum_loss_main': cum_loss_main,
-                    'cum_loss_mtp': cum_loss_mtp
-                }
-                
-                torch.save(ckpt, ckpt_path)
-                print_rank0(f"Checkpoint saved to {ckpt_path}")
-
-        # If we broke early due to time limit, exit without doing final save
-        if time_exceeded:
-            sys.exit(0)
-
-        # after all epochs (only rank 0 saves)
+        # Save final model
         if args.model_save_path and rank == 0:
             final_ckpt = {
                 'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),

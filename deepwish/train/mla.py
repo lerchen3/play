@@ -7,15 +7,16 @@ import os
 # Add project root to Python path for all imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from train.attention import BaseAttention
 from train.rope import RoPE
-from train.kernels.fa2 import attention
 
 
-class MLA(nn.Module):
-    def __init__(self, d_model, n_heads, dc_kv, dc_q, seq_len, device, d_head_override=None):
-        super().__init__()
-        self.d_model, self.n_heads = d_model, n_heads
-        self.d_head = d_model//n_heads if d_head_override is None else d_head_override
+class MLA(BaseAttention):
+    def __init__(self, d_model, n_heads, dc_kv, dc_q, seq_len, device, d_head_override=None, window_size=None):
+        d_head = d_model//n_heads if d_head_override is None else d_head_override
+        super().__init__(d_model, n_heads, d_head, seq_len, use_nsa=False, window_size=window_size)
+        self.dc_kv = dc_kv
+        self.dc_q = dc_q
         self.W_dkv = nn.Parameter(torch.randn(d_model, dc_kv) / math.sqrt(d_model))
         self.W_uk  = nn.Parameter(torch.randn(dc_kv, n_heads * self.d_head) / math.sqrt(dc_kv))
         self.W_uv  = nn.Parameter(torch.randn(dc_kv, n_heads * 2 * self.d_head) / math.sqrt(dc_kv))
@@ -26,6 +27,7 @@ class MLA(nn.Module):
         self.W_qr  = nn.Parameter(torch.randn(dc_q, n_heads * self.d_head) / math.sqrt(dc_q))
         self.rope_q = RoPE(self.d_head, seq_len)
         self.W_o   = nn.Parameter(torch.randn(n_heads * 2 * self.d_head, d_model) / math.sqrt(n_heads * 2 * self.d_head))
+        # Override scale for MLA (uses 2 * d_head)
         self.scale = (self.d_head * 2) ** -0.5
 
     def forward(self, h, cached_c_kv=None, cached_kR=None, cached_len=0, return_latent=False):
@@ -115,44 +117,11 @@ class MLA(nn.Module):
             qR = self.rope_q((c_q @ self.W_qr).view(B, S, self.n_heads, self.d_head), offset=0)
             q_full = torch.cat((qU, qR), dim=-1).permute(0, 2, 1, 3)
 
-        # Attention: Use regular PyTorch for inference, FlashAttention for training
-        if self.training:
-            # Training: Use FlashAttention kernel
-            out = attention(q_full, k, v, self.scale)
-        else:
-            # Inference: Use regular PyTorch operations for better numerical stability
-            if cached_len == 0:  # Only print on first call to avoid spam
-                print("Using PyTorch attention (not FlashAttention) for inference")
-            
-            # q_full: (B, H, T, 2*d_head), k: (B, H, T, 2*d_head), v: (B, H, T, 2*d_head)
-            scores = torch.matmul(q_full, k.transpose(-2, -1)) * self.scale  # (B, H, T, T)
-            
-            # Apply causal mask
-            seq_len = scores.size(-1)
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=scores.device), diagonal=1).bool()
-            scores = scores.masked_fill(causal_mask, float('-inf'))
-            
-            # Softmax with better numerical stability
-            attn_weights = torch.softmax(scores, dim=-1)  # (B, H, T, T)
-            
-            # Check for numerical issues in attention weights
-            if not torch.isfinite(attn_weights).all():
-                print(f"Warning: NaN/Inf in attention weights! scores range: [{scores.min().item():.2f}, {scores.max().item():.2f}]")
-                attn_weights = torch.where(torch.isfinite(attn_weights), attn_weights, torch.zeros_like(attn_weights))
-                # Renormalize
-                attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
-            
-            # Apply to values
-            out = torch.matmul(attn_weights, v)  # (B, H, T, 2*d_head)
+        # Determine if this is single-token decoding
+        is_decoding = (cached_len > 0 and S == 1)
         
-        # Validate attention output
-        if not torch.isfinite(out).all():
-            print("Warning: NaN/Inf detected in attention output!")
-            if self.training:
-                print("Issue is in FlashAttention kernel")
-            else:
-                print("Issue is in PyTorch attention computation")
-            out = torch.zeros_like(out)
+        # Use inherited attention computation
+        out = self.compute_attention(q_full, k, v, is_decoding)
         
         out = out.permute(0, 2, 1, 3).reshape(B, T, -1)
         out = out @ self.W_o

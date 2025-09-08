@@ -7,8 +7,9 @@ cp -r /kaggle/input/deepwish /kaggle/working/
 # Ensure Python can import the local package
 export PYTHONPATH=/kaggle/working/deepwish/gpt:${PYTHONPATH}
 
-# Launch distributed training with the new fp32 offload trainer using chat template
+# Launch distributed training with the unified trainer using chat template
 python -m torch.distributed.run --nproc_per_node=4 /kaggle/working/deepwish/gpt/train/train.py \
+  --architecture deepseekv3 \
   --data_path /kaggle/working/openr1_math220k_conversations.csv \
   --user_column user \
   --assistant_column assistant \

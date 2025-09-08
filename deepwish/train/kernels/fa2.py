@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 import triton.testing
-DEVICE = "cuda"
 
 @triton.jit
 # Block-wise attention forward with explicit diagonal flag
@@ -35,6 +34,8 @@ def attention_forward_block(acc, l_i, m_i, q,  \
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             qk = qk * qk_scale - m_ij[:, None]
         p = tl.math.exp2(qk)
+        # exp2 is preferred over exp since GPUs natively implement exp2; exp(x) = exp2(x * 1/log(2)).
+        # By folding 1/log(2) into sm_scale, we reduce each element to a single multiply and exp2.
         l_ij = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
@@ -335,12 +336,12 @@ def test_forward():
     head_dim = 64
     sm_scale = 0.5
 
-    q = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=DEVICE, requires_grad=True)
-    k = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=DEVICE, requires_grad=True)
-    v = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=DEVICE, requires_grad=True)
+    q = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device="cuda", requires_grad=True)
+    k = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device="cuda", requires_grad=True)
+    v = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device="cuda", requires_grad=True)
 
     p = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
-    tril = torch.tril(torch.ones((n_ctx, n_ctx), device=DEVICE))
+    tril = torch.tril(torch.ones((n_ctx, n_ctx), device="cuda"))
     p = p.masked_fill(tril == 0, float("-inf"))
     p = torch.softmax(p.float(), dim=-1)
     ref_out = torch.matmul(p, v)
@@ -361,12 +362,12 @@ def test_backward():
     head_dim = 64
     sm_scale = 0.5
 
-    q = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=DEVICE, requires_grad=True)
-    k = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=DEVICE, requires_grad=True)
-    v = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=DEVICE, requires_grad=True)
+    q = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device="cuda", requires_grad=True)
+    k = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device="cuda", requires_grad=True)
+    v = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device="cuda", requires_grad=True)
 
     p = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
-    tril = torch.tril(torch.ones((n_ctx, n_ctx), device=DEVICE))
+    tril = torch.tril(torch.ones((n_ctx, n_ctx), device="cuda"))
     p = p.masked_fill(tril == 0, float("-inf"))
     p = torch.softmax(p.float(), dim=-1)
     ref_out = torch.matmul(p, v)
@@ -420,7 +421,7 @@ if __name__ == "__main__":
 
     # setup parameters for benchmarks
     batch_size, n_heads, n_ctx, head_dim = 1, 32, 2048, 64
-    device = torch.device(DEVICE)
+    device = torch.device("cuda")
     sm_scale = 0.5
     q = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=device, requires_grad=True)
     k = torch.randn_like(q)
@@ -471,7 +472,7 @@ if __name__ == "__main__":
     ]
     @triton.testing.perf_report(configs)
     def benchmark(n_ctx, provider, batch_size, n_heads, head_dim, sm_scale):
-        device = torch.device(DEVICE)
+        device = torch.device("cuda")
         q = torch.randn((batch_size, n_heads, n_ctx, head_dim), dtype=torch.float32, device=device)
         k = torch.randn_like(q)
         v = torch.randn_like(q)
