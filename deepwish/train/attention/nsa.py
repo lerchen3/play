@@ -239,14 +239,8 @@ class NativeSparseAttention(nn.Module):
             prob_cmp = torch.softmax(attn_cmp, dim=-1)  # (B,G,Hg,nb)
             out_cmp_heads = torch.einsum('bghn,bgnd->bghd', prob_cmp, Vcmp_g)  # (B,G,Hg,d)
 
-            # Selected branch: vectorized row-mask + kernel call (no Python loops)
-            # Build block->token map once for current length
+            # Selected branch: build indices and use indices-based kernel
             nb = len(self._block_starts)
-            t_ar = torch.arange(Ttot, device=device)
-            starts = torch.tensor(self._block_starts, device=device)
-            ends = torch.minimum(starts + self.cmp_blk_size, torch.full_like(starts, Ttot))
-            block2tok = (t_ar[None, :] >= starts[:, None]) & (t_ar[None, :] < ends[:, None])  # (nb, Ttot)
-            # Build selected block mask per (B,G) for the last token
             sel_blocks_all = torch.cat([
                 torch.zeros(B, G, 1, dtype=torch.long, device=device),
                 torch.full((B, G, 1), max(0, nb - 2), dtype=torch.long, device=device),
@@ -255,16 +249,17 @@ class NativeSparseAttention(nn.Module):
             ], dim=-1)  # (B,G,3+topn)
             blk_mask_bg = torch.zeros(B, G, nb, dtype=torch.int8, device=device)
             blk_mask_bg.scatter_(dim=2, index=sel_blocks_all, src=torch.ones_like(sel_blocks_all, dtype=torch.int8))
-            blk_mask_bg = blk_mask_bg.bool()
-            # tokens selected as union of tokens from selected blocks
-            tok_mask_bg = (blk_mask_bg[..., None] & block2tok[None, None, :, :]).any(dim=2)  # (B,G,Ttot)
-            # Restrict to causal (<= last index) — already true for 0..Ttot-1
-            row_mask = tok_mask_bg.unsqueeze(2).to(torch.int32)  # (B,G,1,Ttot)
+            block_count = blk_mask_bg.sum(dim=-1).to(torch.int32)  # (B,G)
+            Kmax = min(nb, sel_blocks_all.shape[-1])
+            # get up to Kmax indices per (B,G) where mask is 1
+            idx = torch.topk(blk_mask_bg.to(torch.int32), k=Kmax, dim=-1).indices  # (B,G,Kmax)
+            block_idx = idx.unsqueeze(2)  # (B,G,1,Kmax)
+            block_count = block_count.unsqueeze(2)  # (B,G,1)
             # Prepare inputs for kernel
             q_slc = q_last.mean(dim=2).unsqueeze(2)  # (B,G,1,d)
-            Kslc = self._cache_slc_k.permute(0, 2, 1, 3)  # (B,G,Ttot,d)
-            Vslc = self._cache_slc_v.permute(0, 2, 1, 3)
-            out_slc_group = select_attention(q_slc, Kslc, Vslc, scale, row_mask=row_mask)  # (B,G,1,d)
+            Kslc_full = self._cache_slc_k.permute(0, 2, 1, 3)  # (B,G,Ttot,d)
+            Vslc_full = self._cache_slc_v.permute(0, 2, 1, 3)
+            out_slc_group = select_attention(q_slc, Kslc_full, Vslc_full, scale, block_idx, block_count, self.cmp_blk_size)  # (B,G,1,d)
             out_slc_heads = out_slc_group.unsqueeze(2).expand(B, G, Hg, 1, self.d_head)
 
             # Sliding window branch via kernel for last position
@@ -373,25 +368,19 @@ class NativeSparseAttention(nn.Module):
             torch.full((B, G, T), max(0, nb - 2), device=device, dtype=torch.long),
             torch.full((B, G, T), max(0, nb - 1), device=device, dtype=torch.long)
         ], dim=-1)
-        # Build row-wise mask over selected tokens for kernel (B,G,T,N_sel) using vectorization
-        # Map blocks -> tokens once
-        t_ar = torch.arange(T, device=device)
-        starts = torch.tensor(block_starts, device=device)
-        ends = torch.minimum(starts + self.cmp_blk_size, torch.full_like(starts, T))
-        block2tok = (t_ar[None, :] >= starts[:, None]) & (t_ar[None, :] < ends[:, None])  # (nb, T)
-        # union selected blocks across time per (B,G)
+        # Build per-row unique block indices and counts; call indices-based kernel
         sel_blocks_all = torch.cat([forced_sink, last_two, top_idx], dim=-1)  # (B,G,T,topk+3)
         blk_mask_bgt = torch.zeros(B, G, T, nb, dtype=torch.int8, device=device)
         blk_mask_bgt.scatter_(dim=3, index=sel_blocks_all, src=torch.ones_like(sel_blocks_all, dtype=torch.int8))
-        blk_mask_bg = blk_mask_bgt.bool().any(dim=2)  # (B,G,nb)
-        token_mask_bg = (blk_mask_bg[..., None] & block2tok[None, None, :, :]).any(dim=2)  # (B,G,T)
-        # Build row_mask with causality (t can only see tokens <= t)
-        causal = torch.tril(torch.ones((T, T), dtype=torch.bool, device=device))  # (T,T)
-        row_mask = (token_mask_bg.unsqueeze(2) & causal.unsqueeze(0).unsqueeze(0)).to(torch.int32)  # (B,G,T,T)
-        # 5) Selected attention via kernel with row_mask, using full sequence as candidate set to avoid Python packing
-        Kslc = k_slc_kv.permute(0, 2, 1, 3)  # (B,G,T,d)
-        Vslc = v_slc_kv.permute(0, 2, 1, 3)
-        out_slc_group = select_attention(q_g.mean(dim=2), Kslc, Vslc, scale, row_mask=row_mask)  # (B,G,T,d)
+        block_count = blk_mask_bgt.sum(dim=-1).to(torch.int32)  # (B,G,T)
+        Kmax = min(nb, sel_blocks_all.shape[-1])
+        # pick up to Kmax indices where mask==1 for each row
+        idx = torch.topk(blk_mask_bgt.to(torch.int32), k=Kmax, dim=-1).indices  # (B,G,T,Kmax)
+        block_idx = idx
+        # prepare inputs and call kernel
+        Kslc_full = k_slc_kv.permute(0, 2, 1, 3)  # (B,G,T,d)
+        Vslc_full = v_slc_kv.permute(0, 2, 1, 3)
+        out_slc_group = select_attention(q_g.mean(dim=2), Kslc_full, Vslc_full, scale, block_idx, block_count, self.cmp_blk_size)  # (B,G,T,d)
         out_slc_heads = out_slc_group.unsqueeze(2).expand(B, G, Hg, T, self.d_head)
 
         # 6) Sliding window branch via causal kernel per head

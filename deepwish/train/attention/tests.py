@@ -39,14 +39,21 @@ def test_select_matches_dense_small():
     full_k = torch.randn(B, G, T, D, device='cuda', dtype=torch.float32)
     full_v = torch.randn(B, G, T, D, device='cuda', dtype=torch.float32)
     sel_idx = torch.randperm(T, device='cuda')[:Ns]
-    k = full_k[:, :, sel_idx]
-    v = full_v[:, :, sel_idx]
+    # indices-based API: use cmp_blk_size=1 so indices are token indices
+    Kmax = Ns
+    cmp_blk_size = 1
+    block_idx = torch.full((B, G, T, Kmax), 0, device='cuda', dtype=torch.int32)
+    block_idx[..., :Ns] = sel_idx.view(1, 1, 1, Ns)
+    block_count = torch.full((B, G, T), Ns, device='cuda', dtype=torch.int32)
     sm = 0.5
-    out_sel = select_attention(q, k, v, sm)
-    # Dense reference over selected positions only
-    scores = torch.einsum('bgtd,bgnd->bgtn', q, k) * sm
-    p = torch.softmax(scores.float(), dim=-1).to(v.dtype)
-    ref = torch.einsum('bgtn,bgnd->bgtd', p, v)
+    out_sel = select_attention(q, full_k, full_v, sm, block_idx, block_count, cmp_blk_size)
+    # Dense reference over selected positions only (per row causal is enforced inside kernel)
+    # For testing, ignore causality to compare the attention over selected set only
+    k_sel = full_k[:, :, sel_idx]
+    v_sel = full_v[:, :, sel_idx]
+    scores = torch.einsum('bgtd,bgnd->bgtn', q, k_sel) * sm
+    p = torch.softmax(scores.float(), dim=-1).to(v_sel.dtype)
+    ref = torch.einsum('bgtn,bgnd->bgtd', p, v_sel)
     assert torch.allclose(ref, out_sel, atol=1e-2, rtol=0)
 
 
