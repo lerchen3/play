@@ -1,10 +1,11 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, stride_tok, stride_d, H, N_CTX, \
                    BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr, HEAD_DIM: tl.constexpr, \
-                   start_n, start_m, num_steps, MASK: tl.constexpr, WINDOW_SIZE: tl.constexpr):
+                   start_n, start_m, num_steps, MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -21,12 +22,7 @@ def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, stride_tok, stride_d, H,
         qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
         if MASK:
-            strict = offs_m[None, :] > offs_n[:, None]
-            if WINDOW_SIZE > 0:
-                within = (offs_m[None, :] - offs_n[:, None]) < WINDOW_SIZE
-                mask = strict & within
-            else:
-                mask = strict
+            mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
         o  = tl.load(o_ptrs)
@@ -46,7 +42,7 @@ def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, stride_tok, stride_d, H,
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V, O, do, m, stride_tok, stride_d, H, N_CTX, \
                  BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr, HEAD_DIM: tl.constexpr, \
-                 start_m, start_n, num_steps, MASK: tl.constexpr, WINDOW_SIZE: tl.constexpr):
+                 start_m, start_n, num_steps, MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -64,12 +60,7 @@ def _attn_bwd_dq(dq, q, K, V, O, do, m, stride_tok, stride_d, H, N_CTX, \
         p = tl.math.exp2(qk - m)
         if MASK:
             offs_n_current = curr_n + tl.arange(0, BLOCK_N2)
-            strict = offs_m[:, None] > offs_n_current[None, :]
-            if WINDOW_SIZE > 0:
-                within = (offs_m[:, None] - offs_n_current[None, :]) < WINDOW_SIZE
-                mask = strict & within
-            else:
-                mask = strict
+            mask = (offs_m[:, None] >= offs_n_current[None, :])
             p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - delta[:, None])
@@ -84,7 +75,7 @@ def _attn_bwd_dq(dq, q, K, V, O, do, m, stride_tok, stride_d, H, N_CTX, \
 def _attn_bwd(Q, K, V, sm_scale,  \
               O, DO,  \
               DQ, DK, DV,  \
-              M,  \
+              M,  
               stride_z, stride_h, stride_tok, stride_d,  \
               H, N_CTX,  \
               BLOCK_M1: tl.constexpr,  \
@@ -92,8 +83,7 @@ def _attn_bwd(Q, K, V, sm_scale,  \
               BLOCK_M2: tl.constexpr,  \
               BLOCK_N2: tl.constexpr,  \
               BLK_SLICE_FACTOR: tl.constexpr,  \
-              HEAD_DIM: tl.constexpr,  \
-              WINDOW_SIZE: tl.constexpr):
+              HEAD_DIM: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645956
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
@@ -121,13 +111,13 @@ def _attn_bwd(Q, K, V, sm_scale,  \
     dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, \
                             stride_tok, stride_d, H, N_CTX, \
                             MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM, \
-                            start_n, start_m, num_steps, MASK=True, WINDOW_SIZE=WINDOW_SIZE)
+                            start_n, start_m, num_steps, MASK=True)
     start_m += num_steps * MASK_BLOCK_M1
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, \
                             stride_tok, stride_d, H, N_CTX, \
                             BLOCK_M1, BLOCK_N1, HEAD_DIM, \
-                            start_n, start_m, num_steps, MASK=False, WINDOW_SIZE=WINDOW_SIZE)
+                            start_n, start_m, num_steps, MASK=False)
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv)
     dk *= sm_scale
@@ -146,13 +136,13 @@ def _attn_bwd(Q, K, V, sm_scale,  \
     dq = _attn_bwd_dq(dq, q, K, V, O, do, m, \
                       stride_tok, stride_d, H, N_CTX, \
                       BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM, \
-                      start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, MASK=True, WINDOW_SIZE=WINDOW_SIZE)
+                      start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, MASK=True)
     end_n -= num_steps * MASK_BLOCK_N2
     num_steps = end_n // BLOCK_N2
     dq = _attn_bwd_dq(dq, q, K, V, O, do, m, \
                       stride_tok, stride_d, H, N_CTX, \
                       BLOCK_M2, BLOCK_N2, HEAD_DIM, \
-                      start_m, end_n - num_steps * BLOCK_N2, num_steps, MASK=False, WINDOW_SIZE=WINDOW_SIZE)
+                      start_m, end_n - num_steps * BLOCK_N2, num_steps, MASK=False)
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)

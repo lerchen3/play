@@ -31,8 +31,8 @@ nsa.py (NativeSparseAttention)
   - Steps:
     1) Project per-branch K/V for cmp/slc/win; expand KV heads to Q heads for GQA.
     2) Build compressed block summaries (nb blocks) using learned compressors (two-layer MLP with GELU) over flattened blocks with additive intra-block position embeddings.
-    3) Compressed branch: causal kernel over block summaries with block-causal `row_max` and optional top-k ranking. Output is per-group (B,G,T,d), broadcast to heads in group.
-    4) Selection: compute per-group block scores (sum over heads in group), form per-row top-n block indices; always include sink (block 0) and the last two blocks. Build `block_idx` (B,G,T,Kmax) and `block_count` (B,G,T) and call indices-based select kernel; the kernel loads only referenced blocks directly from full K/V.
+    3) Compressed branch: causal kernel. Output is per-group (B,G,T,d), broadcast to heads in group.
+    4) Selection: run topn to get per-group block scores (sum over heads in group); per-row top-n block indices; always include sink (block 0) and the last two blocks. Build `block_idx` (B,G,T,Kmax) and `block_count` (B,G,T) and call indices-based select kernel; the kernel loads only referenced blocks directly from full K/V.
     5) Sliding window: run causal attention with WINDOW_SIZE via causal wrapper.
     6) Combine with gating: gate(x) -> (B,n_q,T,3). Output shape: (B,T,n_q*d).
   - Side-effect: prefill() caches K/V and block summaries for decode if not decoding.
