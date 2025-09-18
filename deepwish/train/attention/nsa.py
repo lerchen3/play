@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .casual import _attention as casual_attention
 from .select import select_attention
+from .topk import topk_indices
 
 
 class NativeSparseAttention(nn.Module):
@@ -354,15 +355,14 @@ class NativeSparseAttention(nn.Module):
         )  # (B,G,T,d)
         out_cmp_heads = out_cmp_group.unsqueeze(2).expand(B, G, Hg, T, self.d_head)
 
-        # 4) Extract per-row TopK block indices from kernel TopIdx buffers is not exposed; recompute deterministically using same masks
-        # For now, recompute indices via matmul over blocks to build the row mask for select kernel
-        attn_blocks = torch.einsum('bgtd,bgnd->bgtn', q_group, Kcmp_g) * scale
-        t_idx = torch.arange(T, device=device)
-        blk_idx = torch.tensor(block_starts, device=device)
-        causal_mask = blk_idx.view(1, 1, 1, nb) <= t_idx.view(1, 1, T, 1)
-        attn_blocks = attn_blocks.masked_fill(~causal_mask, float('-inf'))
+        # 4) Compute per-row TopK block indices using Triton topk kernel (grouped queries vs block summaries)
+        t_idx = torch.arange(T, device=device, dtype=torch.int32)
+        blk_starts_t = torch.tensor(block_starts, device=device, dtype=torch.int32)
+        row_max_block = torch.bucketize(t_idx, blk_starts_t, right=True) - 1
+        row_max_block = row_max_block.clamp(min=0, max=nb - 1)
+        row_max = row_max_block.view(1, 1, T).expand(B, G, T).contiguous()
         topk = min(self.slc_top_n, nb)
-        top_idx = torch.topk(attn_blocks, k=topk, dim=-1).indices  # (B,G,T,topk)
+        top_idx = topk_indices(q_group, Kcmp_g, scale, topk, row_max)
         forced_sink = torch.zeros(1, 1, 1, 1, device=device, dtype=torch.long).expand(B, G, T, 1)
         last_two = torch.stack([
             torch.full((B, G, T), max(0, nb - 2), device=device, dtype=torch.long),

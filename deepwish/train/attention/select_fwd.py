@@ -42,8 +42,8 @@ def select_attention_forward(
 
     # init accumulators for numerically stable softmax
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    l_i = tl.float32(1.0)
-    m_i = tl.float32(-float("inf"))
+    l_i = 1.0
+    m_i = -float("inf")
     qk_scale = sm_scale * 1.44269504
 
     # Load q row
@@ -52,9 +52,14 @@ def select_attention_forward(
     # Load count and iterate selected block indices
     cnt = tl.load(BlockCount + b * stride_cz + g * stride_cg + t * stride_ct)
     for bi in range(0, KMAX):
-        if bi >= cnt:
-            break
+        valid_bi = bi < cnt
         blk = tl.load(BlockIdx + b * stride_bz + g * stride_bg + t * stride_bt + bi * stride_bk)
+        # deduplicate repeated block indices within this row like the torch reference's set()
+        dup_count = 0
+        for pj in range(0, bi):
+            prev_blk = tl.load(BlockIdx + b * stride_bz + g * stride_bg + t * stride_bt + pj * stride_bk)
+            dup_count += (prev_blk == blk)
+        process_block = valid_bi & (dup_count == 0)
         # compute absolute token range for this block
         blk_start = blk * CMP_BLK_SIZE
         blk_end = tl.minimum(blk_start + CMP_BLK_SIZE, SEQ_LEN)
@@ -64,14 +69,14 @@ def select_attention_forward(
             k_ptr = K_full + b * stride_kz + g * stride_kg + (start_n + offs_n)[None, :] * stride_kn + offs_d[:, None] * stride_kd
             v_ptr = V_full + b * stride_vz + g * stride_vg + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
             # valid cols within context and causal for this row
-            valid = (start_n + offs_n) < blk_end
+            valid = ((start_n + offs_n) < blk_end) & process_block
             causal = (start_n + offs_n) <= t
             col_mask = valid & causal
             # load tiles with mask
             k = tl.load(k_ptr, mask=col_mask[None, :], other=0.0)
-            qk = tl.dot(q, k)
-            # set masked columns to -inf before softmax
-            qk = tl.where(col_mask, qk, -1.0e6)
+            qk = tl.sum(q[:, None] * k, axis=0)
+            # set masked columns to -inf before softmax so they contribute zero prob
+            qk = tl.where(col_mask, qk, -float("inf"))
             m_ij = tl.maximum(m_i, tl.max(qk) * qk_scale)
             qk = qk * qk_scale - m_ij
             p = tl.math.exp2(qk)
@@ -82,7 +87,7 @@ def select_attention_forward(
             v = tl.load(v_ptr, mask=col_mask[:, None], other=0.0)
             p = p.to(tl.float32)
             v = v.to(tl.float32)
-            acc = tl.dot(p, v, acc)
+            acc = acc + tl.sum(v * p[:, None], axis=0)
             m_i = m_ij
             start_n += BLOCK_N
 
