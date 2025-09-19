@@ -1,3 +1,4 @@
+
 import triton
 import triton.language as tl
 
@@ -5,7 +6,8 @@ import triton.language as tl
 @triton.jit
 def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, stride_tok, stride_d, H, N_CTX, \
                    BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr, HEAD_DIM: tl.constexpr, \
-                   start_n, start_m, num_steps, MASK: tl.constexpr):
+                   start_n, start_m, num_steps, MASK: tl.constexpr, WINDOW_SIZE: tl.constexpr, \
+                   HAS_ROW_MAX: tl.constexpr, row_max_base, stride_rmm):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -17,20 +19,43 @@ def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, stride_tok, stride_d, H,
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
         qT = tl.load(qT_ptrs)
+        qT = qT.to(tl.float32)
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
+        if HAS_ROW_MAX:
+            row_max_vals = tl.load(
+                row_max_base + offs_m * stride_rmm,
+                mask=offs_m < N_CTX,
+                other=N_CTX - 1,
+            ).to(tl.int32)
+        else:
+            row_max_vals = tl.full([BLOCK_M1], N_CTX - 1, dtype=tl.int32)
         qkT = tl.dot(k, qT)
-        pT = tl.math.exp2(qkT - m[None, :])
+        qkT = qkT.to(tl.float32)
+        dist = offs_m[None, :] - offs_n[:, None]
+        causal_mask = dist >= 0
+        if WINDOW_SIZE > 0:
+            window_mask = dist < WINDOW_SIZE
+        else:
+            window_mask = tl.full([BLOCK_N1, BLOCK_M1], True, dtype=tl.int1)
+        mask = causal_mask & window_mask
         if MASK:
-            mask = (offs_m[None, :] >= offs_n[:, None])
-            pT = tl.where(mask, pT, 0.0)
-        do = tl.load(do_ptrs)
-        o  = tl.load(o_ptrs)
+            mask = mask & (offs_m[None, :] >= offs_n[:, None])
+        valid_cols = offs_n < N_CTX
+        mask = mask & valid_cols[:, None]
+        if HAS_ROW_MAX:
+            allowed = offs_n[:, None] <= row_max_vals[None, :]
+            mask = mask & allowed
+        pT = tl.math.exp2(qkT - m[None, :])
+        pT = tl.where(mask, pT, 0.0)
+        do = tl.load(do_ptrs).to(tl.float32)
+        o  = tl.load(o_ptrs).to(tl.float32)
         delta = tl.sum(o * do, axis=1)
         ppT = pT.to(tl.float32)
         dv += tl.dot(ppT, do)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - delta[None, :])
+        dsT = tl.where(mask, dsT, 0.0)
         dsT = dsT.to(tl.float32)
         dk += tl.dot(dsT, tl.trans(qT))
         curr_m += step_m
@@ -42,13 +67,14 @@ def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, stride_tok, stride_d, H,
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V, O, do, m, stride_tok, stride_d, H, N_CTX, \
                  BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr, HEAD_DIM: tl.constexpr, \
-                 start_m, start_n, num_steps, MASK: tl.constexpr):
+                 start_m, start_n, num_steps, MASK: tl.constexpr, WINDOW_SIZE: tl.constexpr, \
+                 HAS_ROW_MAX: tl.constexpr, row_max_base, stride_rmm):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    o   = tl.load(O + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    o   = tl.load(O + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
@@ -56,14 +82,35 @@ def _attn_bwd_dq(dq, q, K, V, O, do, m, stride_tok, stride_d, H, N_CTX, \
     for blk_idx in range(num_steps):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
+        kT = kT.to(tl.float32)
+        vT = vT.to(tl.float32)
         qk = tl.dot(q, kT)
-        p = tl.math.exp2(qk - m)
+        qk = qk.to(tl.float32)
+        offs_n_current = curr_n + tl.arange(0, BLOCK_N2)
+        dist = offs_m[:, None] - offs_n_current[None, :]
+        causal_mask = dist >= 0
+        if WINDOW_SIZE > 0:
+            window_mask = dist < WINDOW_SIZE
+        else:
+            window_mask = tl.full([BLOCK_M2, BLOCK_N2], True, dtype=tl.int1)
+        mask = causal_mask & window_mask
+        valid_cols = offs_n_current < N_CTX
+        mask = mask & valid_cols[None, :]
         if MASK:
-            offs_n_current = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n_current[None, :])
-            p = tl.where(mask, p, 0.0)
+            mask = mask & (offs_m[:, None] >= offs_n_current[None, :])
+        if HAS_ROW_MAX:
+            row_max_vals = tl.load(
+                row_max_base + offs_m * stride_rmm,
+                mask=offs_m < N_CTX,
+                other=N_CTX - 1,
+            ).to(tl.int32)
+            allowed = offs_n_current[None, :] <= row_max_vals[:, None]
+            mask = mask & allowed
+        p = tl.math.exp2(qk - m)
+        p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - delta[:, None])
+        ds = tl.where(mask, ds, 0.0)
         ds = ds.to(tl.float32)
         dq += tl.dot(ds, tl.trans(kT))
         curr_n += step_n
@@ -75,7 +122,7 @@ def _attn_bwd_dq(dq, q, K, V, O, do, m, stride_tok, stride_d, H, N_CTX, \
 def _attn_bwd(Q, K, V, sm_scale,  \
               O, DO,  \
               DQ, DK, DV,  \
-              M,  
+              M,
               stride_z, stride_h, stride_tok, stride_d,  \
               H, N_CTX,  \
               BLOCK_M1: tl.constexpr,  \
@@ -83,7 +130,10 @@ def _attn_bwd(Q, K, V, sm_scale,  \
               BLOCK_M2: tl.constexpr,  \
               BLOCK_N2: tl.constexpr,  \
               BLK_SLICE_FACTOR: tl.constexpr,  \
-              HEAD_DIM: tl.constexpr):
+              WINDOW_SIZE: tl.constexpr,  \
+              HEAD_DIM: tl.constexpr,  \
+              HAS_ROW_MAX: tl.constexpr,  \
+              RowMax, stride_rmz, stride_rmh, stride_rmm):
     LN2: tl.constexpr = 0.6931471824645956
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
@@ -107,17 +157,27 @@ def _attn_bwd(Q, K, V, sm_scale,  \
     dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
     k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
     v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    k = k.to(tl.float32)
+    v = v.to(tl.float32)
+    if HAS_ROW_MAX:
+        batch_id = bhid // H
+        head_id = bhid % H
+        row_max_base = RowMax + batch_id.to(tl.int64) * stride_rmz + head_id.to(tl.int64) * stride_rmh
+    else:
+        row_max_base = RowMax
     num_steps = BLOCK_N1 // MASK_BLOCK_M1
     dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, \
                             stride_tok, stride_d, H, N_CTX, \
                             MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM, \
-                            start_n, start_m, num_steps, MASK=True)
+                            start_n, start_m, num_steps, MASK=True, WINDOW_SIZE=WINDOW_SIZE, \
+                            HAS_ROW_MAX=HAS_ROW_MAX, row_max_base=row_max_base, stride_rmm=stride_rmm)
     start_m += num_steps * MASK_BLOCK_M1
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, O, DO, M, \
                             stride_tok, stride_d, H, N_CTX, \
                             BLOCK_M1, BLOCK_N1, HEAD_DIM, \
-                            start_n, start_m, num_steps, MASK=False)
+                            start_n, start_m, num_steps, MASK=False, WINDOW_SIZE=WINDOW_SIZE, \
+                            HAS_ROW_MAX=HAS_ROW_MAX, row_max_base=row_max_base, stride_rmm=stride_rmm)
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv)
     dk *= sm_scale
@@ -127,22 +187,24 @@ def _attn_bwd(Q, K, V, sm_scale,  \
     end_n = start_m + BLOCK_M2
     MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
     offs_m = start_m + tl.arange(0, BLOCK_M2)
-    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d).to(tl.float32)
     dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-    do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d).to(tl.float32)
     m = tl.load(M + offs_m)
     m = m[:, None]
     num_steps = BLOCK_M2 // MASK_BLOCK_N2
     dq = _attn_bwd_dq(dq, q, K, V, O, do, m, \
                       stride_tok, stride_d, H, N_CTX, \
                       BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM, \
-                      start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, MASK=True)
+                      start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, MASK=True, WINDOW_SIZE=WINDOW_SIZE, \
+                      HAS_ROW_MAX=HAS_ROW_MAX, row_max_base=row_max_base, stride_rmm=stride_rmm)
     end_n -= num_steps * MASK_BLOCK_N2
     num_steps = end_n // BLOCK_N2
     dq = _attn_bwd_dq(dq, q, K, V, O, do, m, \
                       stride_tok, stride_d, H, N_CTX, \
                       BLOCK_M2, BLOCK_N2, HEAD_DIM, \
-                      start_m, end_n - num_steps * BLOCK_N2, num_steps, MASK=False)
+                      start_m, end_n - num_steps * BLOCK_N2, num_steps, MASK=False, WINDOW_SIZE=WINDOW_SIZE, \
+                      HAS_ROW_MAX=HAS_ROW_MAX, row_max_base=row_max_base, stride_rmm=stride_rmm)
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)

@@ -1,0 +1,84 @@
+{
+  "triton_cce_loss": {
+    "name": "triton_cce_loss",
+    "param_name": "vocab",
+    "values": [
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "benchmarks": [
+      {
+        "name": "triton_cce_loss",
+        "torch_fwd_ms": 0.38727679252624514,
+        "triton_fwd_ms": 3.0457855224609376,
+        "torch_bwd_ms": 0.7030783772468567,
+        "triton_bwd_ms": 94.84677124023438
+      },
+      {
+        "name": "triton_cce_loss",
+        "torch_fwd_ms": 0.5285888195037842,
+        "triton_fwd_ms": 4.41077766418457,
+        "torch_bwd_ms": 1.0469375848770142,
+        "triton_bwd_ms": 187.11183166503906
+      },
+      {
+        "name": "triton_cce_loss",
+        "torch_fwd_ms": 0.9269248008728027,
+        "triton_fwd_ms": 8.290918731689453,
+        "torch_bwd_ms": 1.696563220024109,
+        "triton_bwd_ms": 371.1076354980469
+      },
+      {
+        "name": "triton_cce_loss",
+        "torch_fwd_ms": 1.6535551071166992,
+        "triton_fwd_ms": 15.99303741455078,
+        "torch_bwd_ms": 3.1399936199188234,
+        "triton_bwd_ms": 739.34970703125
+      }
+    ],
+    "configs": [
+      {
+        "batch": 4,
+        "seq": 1024,
+        "dim": 1024,
+        "vocab": 2048,
+        "dtype": "torch.float32",
+        "block_size": 128,
+        "warmup": 1,
+        "iters": 5
+      },
+      {
+        "batch": 4,
+        "seq": 1024,
+        "dim": 1024,
+        "vocab": 4096,
+        "dtype": "torch.float32",
+        "block_size": 128,
+        "warmup": 1,
+        "iters": 5
+      },
+      {
+        "batch": 4,
+        "seq": 1024,
+        "dim": 1024,
+        "vocab": 8192,
+        "dtype": "torch.float32",
+        "block_size": 128,
+        "warmup": 1,
+        "iters": 5
+      },
+      {
+        "batch": 4,
+        "seq": 1024,
+        "dim": 1024,
+        "vocab": 16384,
+        "dtype": "torch.float32",
+        "block_size": 128,
+        "warmup": 1,
+        "iters": 5
+      }
+    ]
+  }
+}

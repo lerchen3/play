@@ -1,23 +1,19 @@
 import torch
+import argparse
+import math
+import os
+import time
+
+import pandas as pd
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-import argparse
-import os
-import math
-import time
-import sys
-import torch.distributed as dist
-import os
+from torch.utils.data import DataLoader, Dataset
 
-# Add project root to Python path for all imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from transformers import AutoTokenizer
-from train.model import DeepSeekV3Model
-from train.offload_step import run_offload_deepseek_step
+from model.deepseekv3 import DeepSeekV3Model
+from train.offload_step_dsv3 import run_offload_deepseek_step
+from train.utils import load_tokenizer
 
 try:
     import matplotlib.pyplot as plt
@@ -74,6 +70,8 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default=None, help='Path to CSV with chat data')
     parser.add_argument('--user_column', type=str, default='user', help='User column name in CSV')
     parser.add_argument('--assistant_column', type=str, default='assistant', help='Assistant column name in CSV')
+    parser.add_argument('--tokenizer_path', type=str, default='Qwen/Qwen3-0.6B',
+                        help='Tokenizer identifier or path used for training')
     parser.add_argument('--seq_len', type=int, default=2048, help='Sequence length')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
@@ -201,9 +199,9 @@ def main():
         args = parse_args()
         print(f"[RANK {rank}] Args parsed successfully", flush=True)
         
-        # Initialize tokenizer (local path)
-        print(f"[RANK {rank}] Loading tokenizer from local Qwen path...", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained("/kaggle/input/qwen-3/transformers/0.6b/1")
+        # Initialize tokenizer
+        print(f"[RANK {rank}] Loading tokenizer from {args.tokenizer_path}...", flush=True)
+        tokenizer = load_tokenizer(args.tokenizer_path)
 
         # Ensure pad token exists
         if tokenizer.pad_token_id is None:

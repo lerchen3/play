@@ -1,7 +1,8 @@
 import torch
 import triton
+
 from .select_fwd import select_attention_forward
-from .select_bwd import _select_bwd
+from .select_bwd import select_attention_backward
 
 
 class _select_attention(torch.autograd.Function):
@@ -15,6 +16,7 @@ class _select_attention(torch.autograd.Function):
         N_ctx = k_full.shape[2]
         Kmax = block_idx.shape[-1]
         grid = (T, B * G)
+        max_tiles = (cmp_blk_size + 32 - 1) // 32
         select_attention_forward[grid](
             q, k_full, v_full, sm_scale, o, M,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -27,6 +29,7 @@ class _select_attention(torch.autograd.Function):
             B, G, T, N_ctx, cmp_blk_size, Kmax,
             HEAD_DIM=D,
             BLOCK_N=32,
+            MAX_TILES=max_tiles,
         )
         ctx.save_for_backward(q, k_full, v_full, o, M, block_idx, block_count)
         ctx.sm_scale = sm_scale
@@ -35,7 +38,6 @@ class _select_attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        from .select_bwd import select_attention_backward
         q, k_full, v_full, o, M, block_idx, block_count = ctx.saved_tensors
         B, G, T, D = q.shape
         N_ctx = k_full.shape[2]
@@ -44,6 +46,7 @@ class _select_attention(torch.autograd.Function):
         dk = torch.zeros_like(k_full)
         dv = torch.zeros_like(v_full)
         grid = (T, B * G)
+        max_tiles = (ctx.cmp_blk_size + 32 - 1) // 32
         select_attention_backward[grid](
             q, k_full, v_full, ctx.sm_scale,
             o, do,
@@ -61,6 +64,7 @@ class _select_attention(torch.autograd.Function):
             B, G, T, N_ctx, ctx.cmp_blk_size, Kmax,
             HEAD_DIM=D,
             BLOCK_N=32,
+            MAX_TILES=max_tiles,
         )
         return dq, dk, dv, None, None, None, None
 

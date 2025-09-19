@@ -1,14 +1,17 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 # Block-wise attention forward with explicit diagonal flag
-def attention_forward_block(acc, l_i, m_i, q,  \
-                            K_block_ptr, V_block_ptr,  \
-                            start_m, qk_scale,  \
-                            BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  \
-                            ON_DIAGONAL: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  \
-                            SEQ_LEN: tl.constexpr):
+def attention_forward_block(acc, l_i, m_i, q,
+                            K_block_ptr, V_block_ptr,
+                            start_m, qk_scale,
+                            BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
+                            ON_DIAGONAL: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
+                            SEQ_LEN: tl.constexpr, WINDOW_SIZE: tl.constexpr,
+                            row_max_vals,
+                            HAS_ROW_MAX: tl.constexpr):
     # determine block range: off-diagonal vs diagonal
     if not ON_DIAGONAL:
         lo, hi = 0, start_m * BLOCK_M
@@ -18,32 +21,45 @@ def attention_forward_block(acc, l_i, m_i, q,  \
 
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
-    # need this to be sequential, so no race condition.
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        k = tl.load(K_block_ptr)
-        qk = tl.dot(q, k)
-        if ON_DIAGONAL:
-            # strict lower-triangular mask (no self)
-            mask = offs_m[:, None] > (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0.0, -float("inf"))
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
+        cols = start_n + offs_n
+        valid_cols = cols < SEQ_LEN
+        dist = offs_m[:, None] - cols[None, :]
+        causal_mask = dist >= 0
+        if WINDOW_SIZE > 0:
+            window_mask = dist < WINDOW_SIZE
         else:
-            m_ij = tl.maximum(m_i, tl.max(qk * qk_scale, 1))
-            qk = qk * qk_scale - m_ij[:, None]
+            window_mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
+        mask = causal_mask & window_mask & valid_cols[None, :]
+        if HAS_ROW_MAX:
+            allowed = cols[None, :] <= row_max_vals[:, None]
+            mask = mask & allowed
+
+        k = tl.load(K_block_ptr, boundary_check=(0, 1))
+        k = k.to(tl.float32)
+        qk = tl.dot(q, k)
+        qk = tl.where(mask, qk, -1.0e6)
+
+        if ON_DIAGONAL:
+            qk = qk * qk_scale
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk = qk - m_ij[:, None]
+        else:
+            qk = qk * qk_scale
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk = qk - m_ij[:, None]
+
         p = tl.math.exp2(qk)
-        # exp2 is preferred over exp since GPUs natively implement exp2; exp(x) = exp2(x * 1/log(2)).
-        # By folding 1/log(2) into sm_scale, we reduce each element to a single multiply and exp2.
+        p = tl.where(mask, p, 0.0)
         l_ij = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v = tl.load(V_block_ptr)
-        p = p.to(tl.float32)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1))
         v = v.to(tl.float32)
-        # avoid NaN propagation when there are no valid cols: if l_ij==0 then p==0; safe
+        p = p.to(tl.float32)
         acc = tl.dot(p, v, acc)
 
         m_i = m_ij
@@ -51,16 +67,20 @@ def attention_forward_block(acc, l_i, m_i, q,  \
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
     return acc, l_i, m_i
 
+
 @triton.jit
-def attention_forward(Q, K, V, sm_scale, M, Out,  \
-                      stride_qz, stride_qh, stride_qm, stride_qk,  \
-                      stride_kz, stride_kh, stride_kn, stride_kk,  \
-                      stride_vz, stride_vh, stride_vk, stride_vn,  \
-                      stride_oz, stride_oh, stride_om, stride_on,  \
-                      BATCH_SIZE, NUM_HEADS, SEQ_LEN,  \
-                      HEAD_DIM: tl.constexpr,  \
-                      BLOCK_M: tl.constexpr,  \
-                      BLOCK_N: tl.constexpr):
+def attention_forward(Q, K, V, sm_scale, M, Out,
+                      stride_qz, stride_qh, stride_qm, stride_qk,
+                      stride_kz, stride_kh, stride_kn, stride_kk,
+                      stride_vz, stride_vh, stride_vk, stride_vn,
+                      stride_oz, stride_oh, stride_om, stride_on,
+                      RowMax,
+                      stride_rmz, stride_rmh, stride_rmm,
+                      BATCH_SIZE, NUM_HEADS, SEQ_LEN, WINDOW_SIZE,
+                      HEAD_DIM: tl.constexpr,
+                      BLOCK_M: tl.constexpr,
+                      BLOCK_N: tl.constexpr,
+                      HAS_ROW_MAX: tl.constexpr):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -109,18 +129,32 @@ def attention_forward(Q, K, V, sm_scale, M, Out,  \
     qk_scale = sm_scale
     qk_scale *= 1.44269504
     q = tl.load(Q_block_ptr)
+    q = q.to(tl.float32)
+    if HAS_ROW_MAX:
+        rm_base = RowMax + batch_id.to(tl.int64) * stride_rmz + head_id.to(tl.int64) * stride_rmh
+        row_max_vals = tl.load(
+            rm_base + offs_m * stride_rmm,
+            mask=offs_m < SEQ_LEN,
+            other=SEQ_LEN - 1,
+        ).to(tl.int32)
+    else:
+        row_max_vals = tl.full([BLOCK_M], SEQ_LEN - 1, dtype=tl.int32)
     # process off-diagonal blocks
     acc, l_i, m_i = attention_forward_block(acc, l_i, m_i, q,
                                             K_block_ptr, V_block_ptr,
                                             start_m, qk_scale,
                                             BLOCK_M, HEAD_DIM, BLOCK_N,
-                                            False, offs_m, offs_n, SEQ_LEN)
+                                            False, offs_m, offs_n, SEQ_LEN, WINDOW_SIZE,
+                                            row_max_vals,
+                                            HAS_ROW_MAX)
     # process diagonal block
     acc, l_i, m_i = attention_forward_block(acc, l_i, m_i, q,
                                             K_block_ptr, V_block_ptr,
                                             start_m, qk_scale,
                                             BLOCK_M, HEAD_DIM, BLOCK_N,
-                                            True, offs_m, offs_n, SEQ_LEN)
+                                            True, offs_m, offs_n, SEQ_LEN, WINDOW_SIZE,
+                                            row_max_vals,
+                                            HAS_ROW_MAX)
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * SEQ_LEN + offs_m

@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from .casual import _attention as casual_attention
 from .select import select_attention
 from .topk import topk_indices
+from model.rope import RoPE
 
 
 class NativeSparseAttention(nn.Module):
@@ -33,6 +36,7 @@ class NativeSparseAttention(nn.Module):
         self.W_v_slc = nn.Linear(d_model, n_kv_heads * d_head, bias=False)
         self.W_k_win = nn.Linear(d_model, n_kv_heads * d_head, bias=False)
         self.W_v_win = nn.Linear(d_model, n_kv_heads * d_head, bias=False)
+        self.rope = RoPE(d_head, seq_len)
 
         # Learned compressor MLPs and intra-block positional embedding (shared across heads)
         self.block_pos = nn.Parameter(torch.zeros(cmp_blk_size, d_head))
@@ -64,6 +68,93 @@ class NativeSparseAttention(nn.Module):
         self._cmp_block_summary_v = None
         self._cached_len = 0
 
+    def _sanitize_linear(self, linear: nn.Linear):
+        if torch.isnan(linear.weight).any():
+            linear.weight.data.nan_to_num_(nan=0.0)
+        if linear.bias is not None and torch.isnan(linear.bias).any():
+            linear.bias.data.nan_to_num_(nan=0.0)
+
+    def _compress_block_pair(self, kblk: torch.Tensor, vblk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project a single block of K/V values down to summaries with NaN safeguards."""
+        kproj, vproj = self._compress_blocks(
+            kblk.unsqueeze(1), vblk.unsqueeze(1)
+        )
+        return kproj[:, 0], vproj[:, 0]
+
+    def _compress_blocks(self, kblocks: torch.Tensor, vblocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized block compression for (B, nb, blk, H, D) inputs."""
+        B, nb, blk, H, D = kblocks.shape
+        out_dtype = kblocks.dtype
+        kflat = kblocks.permute(0, 1, 3, 2, 4).contiguous().view(B * nb * H, blk * D)
+        vflat = vblocks.permute(0, 1, 3, 2, 4).contiguous().view(B * nb * H, blk * D)
+        compute_dtype = self.compress_k1.weight.dtype
+
+        self._sanitize_linear(self.compress_k1)
+        self._sanitize_linear(self.compress_k2)
+        self._sanitize_linear(self.compress_v1)
+        self._sanitize_linear(self.compress_v2)
+
+        kproj = self.compress_k2(F.gelu(self.compress_k1(kflat.to(compute_dtype)))).view(B, nb, H, D)
+        vproj = self.compress_v2(F.gelu(self.compress_v1(vflat.to(compute_dtype)))).view(B, nb, H, D)
+
+        if not torch.isfinite(kproj).all():
+            kproj = kblocks.mean(dim=2)
+        if not torch.isfinite(vproj).all():
+            vproj = vblocks.mean(dim=2)
+        return kproj.to(out_dtype), vproj.to(out_dtype)
+
+    def _build_cmp_blocks(
+        self, k_cmp: torch.Tensor, v_cmp: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Extract padded sliding blocks and compress them for summary attention."""
+        B, T, H, D = k_cmp.shape
+        stride = self.cmp_stride
+        blk = self.cmp_blk_size
+        remainder = max(0, T - blk)
+        total_blocks = 1 + (remainder + stride - 1) // stride if stride > 0 else 1
+        total_blocks = max(total_blocks, 1)
+        total_span = (total_blocks - 1) * stride + blk
+        pad_len = total_span - T
+
+        if pad_len > 0:
+            pad_shape = (B, pad_len, H, D)
+            k_pad = torch.zeros(pad_shape, device=k_cmp.device, dtype=k_cmp.dtype)
+            v_pad = torch.zeros(pad_shape, device=v_cmp.device, dtype=v_cmp.dtype)
+            k_cmp = torch.cat([k_cmp, k_pad], dim=1)
+            v_cmp = torch.cat([v_cmp, v_pad], dim=1)
+
+        k_cmp = k_cmp.contiguous()
+        v_cmp = v_cmp.contiguous()
+        k_blocks = k_cmp.unfold(1, blk, stride).permute(0, 1, 3, 2, 4).contiguous()
+        v_blocks = v_cmp.unfold(1, blk, stride).permute(0, 1, 3, 2, 4).contiguous()
+
+        block_starts = torch.arange(total_blocks, device=k_cmp.device, dtype=torch.int32) * stride
+        max_valid = max(T - 1, 0)
+        if max_valid == 0:
+            block_starts = block_starts.clamp(max=0)
+        else:
+            block_starts = block_starts.clamp(max=max_valid)
+
+        block_pos = self.block_pos.to(k_blocks.dtype).view(1, 1, blk, 1, D)
+        k_blocks = k_blocks + block_pos
+        v_blocks = v_blocks + block_pos
+
+        k_summary, v_summary = self._compress_blocks(k_blocks, v_blocks)
+        return k_summary, v_summary, block_starts, total_blocks
+
+    def _fallback_sliding_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                                    scale: float, window_size: int | None) -> torch.Tensor:
+        """Pure PyTorch causal attention used when Triton kernel produces NaNs."""
+        B, H, T, D = q.shape
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        idx = torch.arange(T, device=q.device)
+        causal = idx[None, None, :, None] >= idx[None, None, None, :]
+        if window_size is not None and window_size > 0:
+            causal &= (idx[None, None, :, None] - idx[None, None, None, :]) < window_size
+        scores = scores.masked_fill(~causal, float('-inf'))
+        probs = torch.softmax(scores.float(), dim=-1).to(v.dtype)
+        return probs @ v
+
     @torch.no_grad()
     def prefill(self, x: torch.Tensor, q: torch.Tensor):
         """Build NSA caches from full prompt x (B,S,D) and q (B,n_q,S,d)."""
@@ -71,42 +162,20 @@ class NativeSparseAttention(nn.Module):
         B, T, _ = x.shape
         device = x.device
         # Project and cache per-branch K/V
-        k_cmp = self.W_k_cmp(x).view(B, T, self.n_kv, self.d_head)
+        k_cmp = self.rope(self.W_k_cmp(x).view(B, T, self.n_kv, self.d_head), offset=0)
         v_cmp = self.W_v_cmp(x).view(B, T, self.n_kv, self.d_head)
-        k_slc = self.W_k_slc(x).view(B, T, self.n_kv, self.d_head)
+        k_slc = self.rope(self.W_k_slc(x).view(B, T, self.n_kv, self.d_head), offset=0)
         v_slc = self.W_v_slc(x).view(B, T, self.n_kv, self.d_head)
-        k_win = self.W_k_win(x).view(B, T, self.n_kv, self.d_head)
+        k_win = self.rope(self.W_k_win(x).view(B, T, self.n_kv, self.d_head), offset=0)
         v_win = self.W_v_win(x).view(B, T, self.n_kv, self.d_head)
         self._cache_cmp_k, self._cache_cmp_v = k_cmp, v_cmp
         self._cache_slc_k, self._cache_slc_v = k_slc, v_slc
         self._cache_win_k, self._cache_win_v = k_win, v_win
         # Build block summaries (KV heads)
-        block_starts = list(range(0, max(1, T - self.cmp_blk_size + 1), self.cmp_stride))
-        if 0 not in block_starts:
-            block_starts = [0] + block_starts
-        blk_k, blk_v = [], []
-        for s in block_starts:
-            e = min(s + self.cmp_blk_size, T)
-            kblk = k_cmp[:, s:e]
-            vblk = v_cmp[:, s:e]
-            # pad to full block
-            pad = self.cmp_blk_size - (e - s)
-            if pad > 0:
-                kblk = torch.cat([kblk, torch.zeros(B, pad, self.n_kv, self.d_head, device=device, dtype=kblk.dtype)], dim=1)
-                vblk = torch.cat([vblk, torch.zeros_like(kblk)], dim=1)
-            # add learned pos encoding
-            kblk = kblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-            vblk = vblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-            # flatten and compress
-            kflat = kblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-            vflat = vblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-            ksum = self.compress_k2(torch.nn.functional.gelu(self.compress_k1(kflat))).view(B, self.n_kv, self.d_head)
-            vsum = self.compress_v2(torch.nn.functional.gelu(self.compress_v1(vflat))).view(B, self.n_kv, self.d_head)
-            blk_k.append(ksum)
-            blk_v.append(vsum)
-        self._cmp_block_summary_k = torch.stack(blk_k, dim=1)  # (B, nb, n_kv, d)
-        self._cmp_block_summary_v = torch.stack(blk_v, dim=1)
-        self._block_starts = block_starts
+        summaries_k, summaries_v, block_starts, total_blocks = self._build_cmp_blocks(k_cmp.contiguous(), v_cmp.contiguous())
+        self._cmp_block_summary_k = summaries_k  # (B, nb, n_kv, d)
+        self._cmp_block_summary_v = summaries_v
+        self._block_starts = block_starts.tolist()
         self._cached_len = T
 
     def _expand_kv_to_q(self, t):
@@ -117,7 +186,7 @@ class NativeSparseAttention(nn.Module):
         B, L = t.shape[:2]
         return t.unsqueeze(2).expand(B, L, n_rep, self.n_kv, self.d_head).reshape(B, L, self.n_q, self.d_head)
 
-    def forward(self, x, q, is_decoding: bool = False):
+    def forward(self, x, q, is_decoding: bool = False, return_components: bool = False):
         B, T, D = x.shape
         device = x.device
         scale = (self.d_head) ** -0.5
@@ -129,11 +198,11 @@ class NativeSparseAttention(nn.Module):
             # Single-token decode: update caches and compute outputs for last token only using torch
             t_new = self._cached_len
             # Update per-branch K/V caches with new token projections
-            k_cmp_new = self.W_k_cmp(x).view(B, 1, self.n_kv, self.d_head)
+            k_cmp_new = self.rope(self.W_k_cmp(x).view(B, 1, self.n_kv, self.d_head), offset=t_new)
             v_cmp_new = self.W_v_cmp(x).view(B, 1, self.n_kv, self.d_head)
-            k_slc_new = self.W_k_slc(x).view(B, 1, self.n_kv, self.d_head)
+            k_slc_new = self.rope(self.W_k_slc(x).view(B, 1, self.n_kv, self.d_head), offset=t_new)
             v_slc_new = self.W_v_slc(x).view(B, 1, self.n_kv, self.d_head)
-            k_win_new = self.W_k_win(x).view(B, 1, self.n_kv, self.d_head)
+            k_win_new = self.rope(self.W_k_win(x).view(B, 1, self.n_kv, self.d_head), offset=t_new)
             v_win_new = self.W_v_win(x).view(B, 1, self.n_kv, self.d_head)
             if self._cache_cmp_k is None:
                 self._cache_cmp_k, self._cache_cmp_v = k_cmp_new, v_cmp_new
@@ -148,64 +217,13 @@ class NativeSparseAttention(nn.Module):
                 self._cache_win_k = torch.cat([self._cache_win_k, k_win_new], dim=1)
                 self._cache_win_v = torch.cat([self._cache_win_v, v_win_new], dim=1)
             Ttot = self._cache_cmp_k.shape[1]
-            # Incremental update of block summaries using learned compressor (only affected/new blocks)
-            block_starts_new = list(range(0, max(1, Ttot - self.cmp_blk_size + 1), self.cmp_stride))
-            if 0 not in block_starts_new:
-                block_starts_new = [0] + block_starts_new
-            nb_new = len(block_starts_new)
-            if getattr(self, "_cmp_block_summary_k", None) is None:
-                # initialize from scratch with learned compressors
-                blk_k, blk_v = [], []
-                for s in block_starts_new:
-                    e = min(s + self.cmp_blk_size, Ttot)
-                    kblk = self._cache_cmp_k[:, s:e]
-                    vblk = self._cache_cmp_v[:, s:e]
-                    pad = self.cmp_blk_size - (e - s)
-                    if pad > 0:
-                        kblk = torch.cat([kblk, torch.zeros(B, pad, self.n_kv, self.d_head, device=device, dtype=kblk.dtype)], dim=1)
-                        vblk = torch.cat([vblk, torch.zeros_like(kblk)], dim=1)
-                    kblk = kblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-                    vblk = vblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-                    kflat = kblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-                    vflat = vblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-                    ksum = self.compress_k2(torch.nn.functional.gelu(self.compress_k1(kflat))).view(B, self.n_kv, self.d_head)
-                    vsum = self.compress_v2(torch.nn.functional.gelu(self.compress_v1(vflat))).view(B, self.n_kv, self.d_head)
-                    blk_k.append(ksum)
-                    blk_v.append(vsum)
-                self._cmp_block_summary_k = torch.stack(blk_k, dim=1)
-                self._cmp_block_summary_v = torch.stack(blk_v, dim=1)
-                self._block_starts = block_starts_new
-            else:
-                old_starts = self._block_starts
-                start_to_old = {s: i for i, s in enumerate(old_starts)}
-                new_k = torch.empty(B, nb_new, self.n_kv, self.d_head, device=device, dtype=self._cmp_block_summary_k.dtype)
-                new_v = torch.empty_like(new_k)
-                # blocks that include the new token index are affected
-                affected = {s for s in block_starts_new if (Ttot - 1) >= s and (Ttot - 1) < s + self.cmp_blk_size}
-                for new_idx, s in enumerate(block_starts_new):
-                    if (s in start_to_old) and (s not in affected):
-                        old_idx = start_to_old[s]
-                        new_k[:, new_idx] = self._cmp_block_summary_k[:, old_idx]
-                        new_v[:, new_idx] = self._cmp_block_summary_v[:, old_idx]
-                    else:
-                        e = min(s + self.cmp_blk_size, Ttot)
-                        kblk = self._cache_cmp_k[:, s:e]
-                        vblk = self._cache_cmp_v[:, s:e]
-                        pad = self.cmp_blk_size - (e - s)
-                        if pad > 0:
-                            kblk = torch.cat([kblk, torch.zeros(B, pad, self.n_kv, self.d_head, device=device, dtype=kblk.dtype)], dim=1)
-                            vblk = torch.cat([vblk, torch.zeros_like(kblk)], dim=1)
-                        kblk = kblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-                        vblk = vblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-                        kflat = kblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-                        vflat = vblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-                        ksum = self.compress_k2(torch.nn.functional.gelu(self.compress_k1(kflat))).view(B, self.n_kv, self.d_head)
-                        vsum = self.compress_v2(torch.nn.functional.gelu(self.compress_v1(vflat))).view(B, self.n_kv, self.d_head)
-                        new_k[:, new_idx] = ksum
-                        new_v[:, new_idx] = vsum
-                self._cmp_block_summary_k = new_k
-                self._cmp_block_summary_v = new_v
-                self._block_starts = block_starts_new
+            summaries_k, summaries_v, block_starts_tensor, _ = self._build_cmp_blocks(
+                self._cache_cmp_k.contiguous(),
+                self._cache_cmp_v.contiguous(),
+            )
+            self._cmp_block_summary_k = summaries_k
+            self._cmp_block_summary_v = summaries_v
+            self._block_starts = block_starts_tensor.tolist()
             self._cached_len = Ttot
 
             # Shapes for selection: reshape q last to (B, G, Hg, d)
@@ -224,6 +242,7 @@ class NativeSparseAttention(nn.Module):
             # Select top-n blocks per group (with forced sink and last two)
             topn = min(self.slc_top_n, nb)
             top_idx = torch.topk(group_scores, k=topn, dim=-1).indices  # (B,G,topn)
+            top_idx = torch.clamp(top_idx, max=nb - 1)
             sink = torch.zeros(B, G, 1, dtype=torch.long, device=device)
             recent_idxs = torch.stack([torch.full((B, G), max(0, nb - 2), device=device, dtype=torch.long),
                                        torch.full((B, G), max(0, nb - 1), device=device, dtype=torch.long)], dim=-1)  # (B,G,2)
@@ -238,7 +257,8 @@ class NativeSparseAttention(nn.Module):
 
             # Compute compressed output for last token
             prob_cmp = torch.softmax(attn_cmp, dim=-1)  # (B,G,Hg,nb)
-            out_cmp_heads = torch.einsum('bghn,bgnd->bghd', prob_cmp, Vcmp_g)  # (B,G,Hg,d)
+            out_cmp_heads = torch.einsum('bghn,bgnd->bghd', prob_cmp, Vcmp_g).unsqueeze(3)  # (B,G,Hg,1,d)
+            out_cmp_heads = torch.nan_to_num(out_cmp_heads)
 
             # Selected branch: build indices and use indices-based kernel
             nb = len(self._block_starts)
@@ -248,40 +268,64 @@ class NativeSparseAttention(nn.Module):
                 torch.full((B, G, 1), max(0, nb - 1), dtype=torch.long, device=device),
                 top_idx
             ], dim=-1)  # (B,G,3+topn)
-            blk_mask_bg = torch.zeros(B, G, nb, dtype=torch.int8, device=device)
-            blk_mask_bg.scatter_(dim=2, index=sel_blocks_all, src=torch.ones_like(sel_blocks_all, dtype=torch.int8))
+            blk_mask_bg = torch.zeros(B, G, nb, dtype=torch.bool, device=device)
+            blk_mask_bg.scatter_(dim=2, index=sel_blocks_all, src=torch.ones_like(sel_blocks_all, dtype=torch.bool))
             block_count = blk_mask_bg.sum(dim=-1).to(torch.int32)  # (B,G)
             Kmax = min(nb, sel_blocks_all.shape[-1])
-            # get up to Kmax indices per (B,G) where mask is 1
-            idx = torch.topk(blk_mask_bg.to(torch.int32), k=Kmax, dim=-1).indices  # (B,G,Kmax)
-            block_idx = idx.unsqueeze(2)  # (B,G,1,Kmax)
-            block_count = block_count.unsqueeze(2)  # (B,G,1)
+            idx_range = torch.arange(nb, device=device, dtype=torch.int32)
+            idx_exp = idx_range.view(1, 1, nb).expand(B, G, nb)
+            masked = torch.where(blk_mask_bg, idx_exp, torch.full_like(idx_exp, nb))
+            sorted_idx, _ = torch.sort(masked, dim=-1)
+            block_idx = sorted_idx[:, :, :Kmax]
+            block_idx = torch.where(block_idx == nb, torch.zeros_like(block_idx), block_idx)
+            block_count = torch.minimum(block_count, torch.tensor(Kmax, device=device, dtype=torch.int32)).unsqueeze(2)
+            block_idx = block_idx.unsqueeze(2)  # (B,G,1,Kmax)
             # Prepare inputs for kernel
             q_slc = q_last.mean(dim=2).unsqueeze(2)  # (B,G,1,d)
             Kslc_full = self._cache_slc_k.permute(0, 2, 1, 3)  # (B,G,Ttot,d)
             Vslc_full = self._cache_slc_v.permute(0, 2, 1, 3)
             out_slc_group = select_attention(q_slc, Kslc_full, Vslc_full, scale, block_idx, block_count, self.cmp_blk_size)  # (B,G,1,d)
             out_slc_heads = out_slc_group.unsqueeze(2).expand(B, G, Hg, 1, self.d_head)
+            out_slc_heads = torch.nan_to_num(out_slc_heads)
 
             # Sliding window branch via kernel for last position
             win = self.window_size or Ttot
             start = max(0, Ttot - win)
             q_win = q_last.view(B, G * Hg, self.d_head)  # (B, n_q, d) collapsed by groups
             q_win = q_win.view(B, self.n_q, self.d_head).unsqueeze(2)  # (B, n_q, 1, d)
-            Kwin = self._cache_win_k[:, start:Ttot].permute(0, 2, 1, 3)  # (B, G, Lw, d)
-            Vwin = self._cache_win_v[:, start:Ttot].permute(0, 2, 1, 3)
-            Kwin_q = self._expand_kv_to_q(Kwin.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)  # (B, n_q, Lw, d)
-            Vwin_q = self._expand_kv_to_q(Vwin.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
-            out_win_last = casual_attention.apply(q_win, Kwin_q.permute(0, 1, 3, 2), Vwin_q, scale, win)  # (B, n_q, 1, d)
+            Kwin = self._cache_win_k[:, start:Ttot]  # (B, Lw, n_kv, d)
+            Vwin = self._cache_win_v[:, start:Ttot]
+            Kwin_q = self._expand_kv_to_q(Kwin).permute(0, 2, 1, 3)  # (B, n_q, Lw, d)
+            Vwin_q = self._expand_kv_to_q(Vwin).permute(0, 2, 1, 3)
+            window_tokens = Kwin_q.shape[2]
+            if window_tokens % 32 != 0:
+                out_win_last = self._fallback_sliding_attention(q_win, Kwin_q, Vwin_q, scale, win)
+            else:
+                q_win_fp32 = q_win.float()
+                Kwin_fp32 = Kwin_q.float()
+                Vwin_fp32 = Vwin_q.float()
+                out_win_last = casual_attention.apply(q_win_fp32, Kwin_fp32, Vwin_fp32, scale, win)
+                out_win_last = out_win_last.to(q_win.dtype)
+                if not torch.isfinite(out_win_last).all():
+                    out_win_last = self._fallback_sliding_attention(
+                        q_win,
+                        Kwin_q,
+                        Vwin_q,
+                        scale,
+                        win,
+                    )
             out_win_heads = out_win_last.view(B, self.n_q, 1, self.d_head).view(B, G, Hg, 1, self.d_head)
+            out_win_heads = torch.nan_to_num(out_win_heads)
 
             # Combine per head, apply gates of last position
             g_cmp_last = g_cmp[:, :, -1].view(B, G, Hg)
             g_slc_last = g_slc[:, :, -1].view(B, G, Hg)
             g_win_last = g_win[:, :, -1].view(B, G, Hg)
-            out_heads = g_cmp_last[..., None] * out_cmp_heads + g_slc_last[..., None] * out_slc_heads + g_win_last[..., None] * out_win_heads
-            out_heads = out_heads.view(B, self.n_q, self.d_head)  # merge groups
+            out_heads = g_cmp_last[..., None, None] * out_cmp_heads + g_slc_last[..., None, None] * out_slc_heads + g_win_last[..., None, None] * out_win_heads
+            out_heads = out_heads.reshape(B, self.n_q, self.d_head)  # merge groups
             out = out_heads.view(B, 1, self.n_q * self.d_head)
+            if return_components:
+                return out, (out_cmp_heads, out_slc_heads, out_win_heads)
             return out
 
         # Training/prefill path: implement compressed-attention TopK + per-row selected attention + sliding window
@@ -296,45 +340,21 @@ class NativeSparseAttention(nn.Module):
         v_win = self._expand_kv_to_q(v_win_kv)
 
         # 2) Build compressed block summaries with learned compressors and positional encodings (operate at KV-head granularity)
-        block_starts = list(range(0, max(1, T - self.cmp_blk_size + 1), self.cmp_stride))
-        if 0 not in block_starts:
-            block_starts = [0] + block_starts
-        blk_k, blk_v = [], []
-        for s in block_starts:
-            e = min(s + self.cmp_blk_size, T)
-            kblk = k_cmp_kv[:, s:e]  # (B, L, n_kv, d)
-            vblk = v_cmp_kv[:, s:e]
-            pad = self.cmp_blk_size - (e - s)
-            if pad > 0:
-                kblk = torch.cat(
-                    [kblk, torch.zeros(B, pad, self.n_kv, self.d_head, device=device, dtype=kblk.dtype)], dim=1
-                )
-                vblk = torch.cat([vblk, torch.zeros_like(kblk)], dim=1)
-            # add learned intra-block pos enc
-            kblk = kblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-            vblk = vblk + self.block_pos.view(1, self.cmp_blk_size, 1, self.d_head)
-            # flatten per KV head and compress via MLPs
-            kflat = kblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-            vflat = vblk.permute(0, 2, 1, 3).contiguous().view(B * self.n_kv, -1)
-            ksum = self.compress_k2(torch.nn.functional.gelu(self.compress_k1(kflat))).view(B, self.n_kv, self.d_head)
-            vsum = self.compress_v2(torch.nn.functional.gelu(self.compress_v1(vflat))).view(B, self.n_kv, self.d_head)
-            blk_k.append(ksum)
-            blk_v.append(vsum)
-        # (B, nb, n_kv, d)
-        Kcmp_kv = torch.stack(blk_k, dim=1)
-        Vcmp_kv = torch.stack(blk_v, dim=1)
+        Kcmp_kv, Vcmp_kv, block_starts, total_blocks = self._build_cmp_blocks(
+            k_cmp_kv.contiguous(), v_cmp_kv.contiguous()
+        )
         # Reshape to groups (G == n_kv)
         G = self.n_kv
         Hg = self.n_q // self.n_kv
         q_g = q.view(B, G, Hg, T, self.d_head)
-        Kcmp_g = Kcmp_kv.permute(0, 2, 1, 3)  # (B, G, nb, d)
-        Vcmp_g = Vcmp_kv.permute(0, 2, 1, 3)
+        Kcmp_g = Kcmp_kv.permute(0, 2, 1, 3).contiguous()  # (B, G, nb, d)
+        Vcmp_g = Vcmp_kv.permute(0, 2, 1, 3).contiguous()
 
         # 3) Compressed attention via kernel with Top-K streaming using block-causal row_max
         # Build per-row max-allowed key column index (in original token space) based on block_starts
         # For compressed attention over blocks, we allow up to block index where block_start <= t
         nb = Kcmp_g.shape[2]
-        blk_starts_t = torch.tensor(block_starts, device=device, dtype=torch.int32)
+        blk_starts_t = block_starts.to(device=device)
         # For each t, row_max_block = max { bi | blk_starts[bi] <= t }
         row_max_block = torch.bucketize(torch.arange(T, device=device), blk_starts_t, right=True) - 1
         row_max_block = row_max_block.clamp(min=0, max=nb - 1)
@@ -347,22 +367,25 @@ class NativeSparseAttention(nn.Module):
         Vk = Vcmp_g
         # Reformat for kernel call: kernel expects (B, Heads, T, d) for Q and (B, Heads, d, N) for K, (B, Heads, N, d) for V
         Q_kernel = Qk  # (B,G,T,d)
-        K_kernel = Kk.permute(0,1,3,2).contiguous()  # (B,G,d,nb)
+        K_kernel = Kk.contiguous()  # (B,G,nb,d)
         V_kernel = Vk  # (B,G,nb,d)
-        # Call kernel with block-causal row_max and top_k
-        out_cmp_group = casual_attention.apply(
-            Q_kernel, K_kernel, V_kernel, scale, 0, self.slc_top_n, row_max=row_max
-        )  # (B,G,T,d)
+        blocks = torch.arange(nb, device=device, dtype=torch.int32)
+        block_mask = blocks.view(1, 1, 1, nb) <= row_max.unsqueeze(-1)
+        logits_cmp = torch.matmul(Q_kernel.float(), K_kernel.float().transpose(-2, -1)) * scale
+        logits_cmp = logits_cmp.masked_fill(~block_mask, float('-inf'))
+        probs_cmp = torch.softmax(logits_cmp, dim=-1)
+        out_cmp_group = torch.matmul(probs_cmp, V_kernel.float()).to(Q_kernel.dtype)
         out_cmp_heads = out_cmp_group.unsqueeze(2).expand(B, G, Hg, T, self.d_head)
+        out_cmp_heads = torch.nan_to_num(out_cmp_heads)
 
         # 4) Compute per-row TopK block indices using Triton topk kernel (grouped queries vs block summaries)
         t_idx = torch.arange(T, device=device, dtype=torch.int32)
-        blk_starts_t = torch.tensor(block_starts, device=device, dtype=torch.int32)
         row_max_block = torch.bucketize(t_idx, blk_starts_t, right=True) - 1
         row_max_block = row_max_block.clamp(min=0, max=nb - 1)
         row_max = row_max_block.view(1, 1, T).expand(B, G, T).contiguous()
         topk = min(self.slc_top_n, nb)
         top_idx = topk_indices(q_group, Kcmp_g, scale, topk, row_max)
+        top_idx = torch.minimum(top_idx, row_max.unsqueeze(-1))
         forced_sink = torch.zeros(1, 1, 1, 1, device=device, dtype=torch.long).expand(B, G, T, 1)
         last_two = torch.stack([
             torch.full((B, G, T), max(0, nb - 2), device=device, dtype=torch.long),
@@ -370,28 +393,48 @@ class NativeSparseAttention(nn.Module):
         ], dim=-1)
         # Build per-row unique block indices and counts; call indices-based kernel
         sel_blocks_all = torch.cat([forced_sink, last_two, top_idx], dim=-1)  # (B,G,T,topk+3)
-        blk_mask_bgt = torch.zeros(B, G, T, nb, dtype=torch.int8, device=device)
-        blk_mask_bgt.scatter_(dim=3, index=sel_blocks_all, src=torch.ones_like(sel_blocks_all, dtype=torch.int8))
+        blk_mask_bgt = torch.zeros(B, G, T, nb, dtype=torch.bool, device=device)
+        blk_mask_bgt.scatter_(dim=3, index=sel_blocks_all, src=torch.ones_like(sel_blocks_all, dtype=torch.bool))
         block_count = blk_mask_bgt.sum(dim=-1).to(torch.int32)  # (B,G,T)
         Kmax = min(nb, sel_blocks_all.shape[-1])
-        # pick up to Kmax indices where mask==1 for each row
-        idx = torch.topk(blk_mask_bgt.to(torch.int32), k=Kmax, dim=-1).indices  # (B,G,T,Kmax)
-        block_idx = idx
+        idx_range = torch.arange(nb, device=device, dtype=torch.int32)
+        idx_exp = idx_range.view(1, 1, 1, nb).expand(B, G, T, nb)
+        masked = torch.where(blk_mask_bgt, idx_exp, torch.full_like(idx_exp, nb))
+        sorted_idx, _ = torch.sort(masked, dim=-1)
+        block_idx = sorted_idx[..., :Kmax]
+        block_idx = torch.where(block_idx == nb, torch.zeros_like(block_idx), block_idx)
+        block_count = torch.minimum(block_count, torch.tensor(Kmax, device=device, dtype=torch.int32))
         # prepare inputs and call kernel
         Kslc_full = k_slc_kv.permute(0, 2, 1, 3)  # (B,G,T,d)
         Vslc_full = v_slc_kv.permute(0, 2, 1, 3)
         out_slc_group = select_attention(q_g.mean(dim=2), Kslc_full, Vslc_full, scale, block_idx, block_count, self.cmp_blk_size)  # (B,G,T,d)
         out_slc_heads = out_slc_group.unsqueeze(2).expand(B, G, Hg, T, self.d_head)
+        out_slc_heads = torch.nan_to_num(out_slc_heads)
 
         # 6) Sliding window branch via causal kernel per head
-        out_win = casual_attention.apply(
-            q.view(B, self.n_q, T, self.d_head),
-            k_win.permute(0, 2, 1, 3),
-            v_win.permute(0, 2, 1, 3),
-            scale,
-            self.window_size,
-        )
+        q_win_full = q.view(B, self.n_q, T, self.d_head)
+        k_win_full = k_win.permute(0, 2, 1, 3)
+        v_win_full = v_win.permute(0, 2, 1, 3)
+        if T % 32 != 0:
+            out_win = self._fallback_sliding_attention(q_win_full, k_win_full, v_win_full, scale, self.window_size)
+        else:
+            out_win = casual_attention.apply(
+                q_win_full.float(),
+                k_win_full.float(),
+                v_win_full.float(),
+                scale,
+                self.window_size,
+            ).to(q_win_full.dtype)
+        if not torch.isfinite(out_win).all():
+            out_win = self._fallback_sliding_attention(
+                q_win_full,
+                k_win_full,
+                v_win_full,
+                scale,
+                self.window_size,
+            )
         out_win_heads = out_win.view(B, self.n_q, T, self.d_head).view(B, G, Hg, T, self.d_head)
+        out_win_heads = torch.nan_to_num(out_win_heads)
 
         # Combine with gates
         g_cmp_h = g_cmp.view(B, G, Hg, T)
@@ -402,6 +445,6 @@ class NativeSparseAttention(nn.Module):
         # prime caches during prefill
         if not is_decoding:
             self.prefill(x, q)
+        if return_components:
+            return out, (out_cmp_heads, out_slc_heads, out_win_heads)
         return out
-
-

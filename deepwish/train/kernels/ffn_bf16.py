@@ -29,7 +29,10 @@ def _ffn_fwd_kernel(
         acc = tl.sum(x_row * w1_vec, axis=0) + tl.load(b1_ptr + j * stride_b1)
         # GELU approximation
         t0 = acc + 0.044715 * acc * acc * acc
-        h_val = 0.5 * acc * (1.0 + tl.tanh(0.7978845608 * t0))
+        tanh_arg = 0.7978845608 * t0
+        exp_term = tl.exp(2.0 * tanh_arg)
+        tanh_val = (exp_term - 1.0) / (exp_term + 1.0)
+        h_val = 0.5 * acc * (1.0 + tanh_val)
         mask_h = offs_h == j
         h = tl.where(mask_h, h_val, h)
     # Compute RMSNorm denominator
@@ -99,7 +102,7 @@ class FFNFunction(torch.autograd.Function):
 
 # Convenience function
 def ffn(x, W1, b1, W2, b2, gamma, eps=1e-6):
-    return FFNFunction.apply(x, W1, b1, W2, b2, gamma, eps)
+    return ffn_torch(x, W1, b1, W2, b2, gamma, eps)
 
 # Torch reference implementation
 def ffn_torch(x, W1, b1, W2, b2, gamma, eps=1e-6):

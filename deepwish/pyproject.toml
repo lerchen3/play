@@ -1,0 +1,29 @@
+[tool.black]
+line-length = 100
+exclude = [
+  "\\.git",
+  "\\.venv",
+  "build",
+  "dist",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+exclude = [
+  "build",
+  "dist",
+  "notebooks",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra"
+testpaths = [
+  "tests",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

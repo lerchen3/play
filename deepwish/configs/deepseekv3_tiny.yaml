@@ -1,0 +1,51 @@
+# Tiny configuration for quick sanity checks on a single GPU or CPU.
+architecture: deepseekv3
+tokenizer_path: Qwen/Qwen3-0.6B
+
+# Data
+data_path: examples/sample_conversations.csv
+user_column: user
+assistant_column: assistant
+val_split: 0.2
+
+# Training setup
+seq_len: 128
+batch_size: 2
+epochs: 1
+lr: 5e-4
+grad_accum_steps: 1
+weight_decay: 0.01
+max_grad_norm: 1.0
+lr_warmup_steps: 10
+lr_decay_steps: 200
+seed: 42
+precision: fp32
+num_workers: 0
+log_every: 5
+save_every: 50
+eval_interval: 20
+limit_train_batches: 25
+limit_eval_batches: 10
+
+# Model hyperparameters
+d_model: 128
+num_layers: 4
+n_heads: 8
+d_head: 16
+dc_kv: 16
+dc_q: 16
+n_shared_experts: 1
+n_routed_experts: 2
+k_routed_experts: 1
+d_ff_expert_mult: 2
+moe_balance_factor: 0.01
+bias_update_speed: 0.001
+mtp_depth: 0
+mtp_weight: 0.5
+
+# Checkpointing & logging
+checkpoint_dir: runs/deepseekv3_tiny
+checkpoint_save_path: runs/deepseekv3_tiny/checkpoint.pt
+model_save_path: runs/deepseekv3_tiny/model.pt
+metrics_path: runs/deepseekv3_tiny/metrics.csv
+log_dir: runs/deepseekv3_tiny/tensorboard

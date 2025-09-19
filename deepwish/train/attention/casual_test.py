@@ -7,9 +7,8 @@ from .casual import _attention as causal_attention
 def torch_causal(q, k, v, sm_scale):
     B, H, T, D = q.shape
     scores = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
-    ar = torch.arange(T, device=q.device)
-    mask = ar[None, :] < ar[:, None]
-    scores = scores.masked_fill(~mask, float('-inf'))
+    mask = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+    scores = scores.masked_fill(~mask, float("-inf"))
     p = torch.softmax(scores.float(), dim=-1).to(v.dtype)
     return torch.matmul(p, v)
 
@@ -25,5 +24,4 @@ def test_causal_matches_torch(B, H, T, D):
     ref = torch_causal(q, k, v, sm)
     out = causal_attention.apply(q, k, v, sm)
     assert torch.allclose(ref, out, atol=1e-2, rtol=0)
-
 

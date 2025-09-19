@@ -1,12 +1,7 @@
 import torch
 import torch.distributed as dist
-import sys
-import os
 
-# Add project root to Python path for all imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from train.model import triton_cce_loss
+from model.deepseekv3 import triton_cce_loss
 
 
 def run_offload_deepseek_step(model, inp_ids, target_main, tgt_matrix, args, adam_states, step):

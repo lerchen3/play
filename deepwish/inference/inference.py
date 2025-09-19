@@ -1,28 +1,27 @@
 import argparse
 import os
-import sys
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 import torch
-from transformers import AutoTokenizer
+import yaml
 
-# Add the project root to Python path for all imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-# Also add current directory for local imports
-sys.path.insert(0, os.path.dirname(__file__))
+from model.deepseekv3 import DeepSeekV3Model
+from train.utils import flatten_config, load_tokenizer
+from inference.specdec import generate_speculative
 
-from train.model import DeepSeekV3Model
-from specdec import generate_speculative
+DEFAULT_TOKENIZER_PATH = "Qwen/Qwen3-0.6B"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference with DeepSeek-V3 using latent c_kv cache (recompute K,V).")
 
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML config with CLI keys.')
+
     # Required inputs
     parser.add_argument('--model_save_path', type=str, required=True,
                         help='Path to .pt weights (model_state_dict)')
-    parser.add_argument('--tokenizer_path', type=str, required=True,
-                        help='HF tokenizer directory used for training (e.g., Qwen path)')
+    parser.add_argument('--tokenizer_path', type=str, default=DEFAULT_TOKENIZER_PATH,
+                        help='Tokenizer identifier or directory used for training')
 
     # Prompt and decoding
     parser.add_argument('--prompt', type=str, default='', help='User prompt text')
@@ -55,7 +54,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--bias_update_speed', type=float, default=0.001)
     parser.add_argument('--d_head', type=int, default=16, help='Override attention head dim (default d_model/n_heads)')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.config:
+        with open(args.config, 'r', encoding='utf-8') as handle:
+            config_data = yaml.safe_load(handle) or {}
+        if not isinstance(config_data, dict):
+            raise ValueError('Config file must contain a mapping of CLI keys to values.')
+        flat_config = flatten_config(config_data)
+        for key, value in flat_config.items():
+            if not hasattr(args, key):
+                print(f"[parse_args] Warning: ignoring unknown config key '{key}'")
+                continue
+            default_value = parser.get_default(key)
+            current_value = getattr(args, key)
+            if current_value == default_value:
+                setattr(args, key, value)
+
+    if not args.tokenizer_path:
+        parser.error('`--tokenizer_path` must be supplied either via CLI or config file.')
+
+    return args
 
 
 def build_args_from_tokenizer(cli_args: argparse.Namespace, tokenizer) -> argparse.Namespace:
@@ -209,15 +228,25 @@ def build_prompt_tokens(tokenizer, user_text: str, seq_len: int, device: torch.d
     messages = [
         {"role": "user", "content": user_text},
     ]
-    encoded = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        return_tensors='pt',
-        padding=False,
-        truncation=True,
-        max_length=seq_len,
-        add_generation_prompt=True,
-    )
+    if callable(getattr(tokenizer, "apply_chat_template", None)):
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors='pt',
+            padding=False,
+            truncation=True,
+            max_length=seq_len,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt_text = f"User: {user_text}\nAssistant:"
+        encoded = tokenizer(
+            prompt_text,
+            return_tensors='pt',
+            padding=False,
+            truncation=True,
+            max_length=seq_len,
+        )
     if isinstance(encoded, dict) or hasattr(encoded, 'input_ids'):
         input_ids = (encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids)
     else:
@@ -338,15 +367,10 @@ def main():
     print(f"Using device: {device}")
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(cli.tokenizer_path, trust_remote_code = True)
+        tokenizer = load_tokenizer(cli.tokenizer_path)
     except Exception as e:
         print(f"Error loading tokenizer from {cli.tokenizer_path}: {e}")
         return
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
     args_for_model = build_args_from_tokenizer(cli, tokenizer)
 

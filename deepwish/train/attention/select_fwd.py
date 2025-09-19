@@ -24,6 +24,7 @@ def select_attention_forward(
     BATCH_SIZE, NUM_GROUPS, T_CTX, SEQ_LEN, CMP_BLK_SIZE, KMAX,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    MAX_TILES: tl.constexpr,
 ):
     # program per (timestep, batch-group)
     pid_t = tl.program_id(0)
@@ -42,54 +43,58 @@ def select_attention_forward(
 
     # init accumulators for numerically stable softmax
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    l_i = 1.0
-    m_i = -float("inf")
+    l_i = tl.full([], 1.0, dtype=tl.float32)
+    m_i = tl.full([], -float("inf"), dtype=tl.float32)
     qk_scale = sm_scale * 1.44269504
 
     # Load q row
-    q = tl.load(Q_ptr)
+    q = tl.load(Q_ptr).to(tl.float32)
 
     # Load count and iterate selected block indices
     cnt = tl.load(BlockCount + b * stride_cz + g * stride_cg + t * stride_ct)
+    max_tiles: tl.constexpr = MAX_TILES
     for bi in range(0, KMAX):
-        valid_bi = bi < cnt
-        blk = tl.load(BlockIdx + b * stride_bz + g * stride_bg + t * stride_bt + bi * stride_bk)
-        # deduplicate repeated block indices within this row like the torch reference's set()
-        dup_count = 0
-        for pj in range(0, bi):
-            prev_blk = tl.load(BlockIdx + b * stride_bz + g * stride_bg + t * stride_bt + pj * stride_bk)
-            dup_count += (prev_blk == blk)
-        process_block = valid_bi & (dup_count == 0)
-        # compute absolute token range for this block
+        block_active = bi < cnt
+        blk = tl.load(
+            BlockIdx + b * stride_bz + g * stride_bg + t * stride_bt + bi * stride_bk,
+            mask=block_active,
+            other=0,
+        )
+        duplicate = tl.full([], 0, dtype=tl.int32)
+        for bj in range(0, bi):
+            prev = tl.load(
+                BlockIdx + b * stride_bz + g * stride_bg + t * stride_bt + bj * stride_bk,
+                mask=block_active,
+                other=0,
+            )
+            duplicate = tl.maximum(duplicate, (block_active & (blk == prev)).to(tl.int32))
+        block_active = block_active & (duplicate == 0)
         blk_start = blk * CMP_BLK_SIZE
         blk_end = tl.minimum(blk_start + CMP_BLK_SIZE, SEQ_LEN)
-        # iterate over this block in BLOCK_N tiles
-        start_n = blk_start
-        while start_n < blk_end:
-            k_ptr = K_full + b * stride_kz + g * stride_kg + (start_n + offs_n)[None, :] * stride_kn + offs_d[:, None] * stride_kd
-            v_ptr = V_full + b * stride_vz + g * stride_vg + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
-            # valid cols within context and causal for this row
-            valid = ((start_n + offs_n) < blk_end) & process_block
-            causal = (start_n + offs_n) <= t
+        for tile in range(0, max_tiles):
+            start_n = blk_start + tile * BLOCK_N
+            tile_active = block_active & (start_n < blk_end)
+            cols = start_n + offs_n
+            valid = (cols < blk_end) & tile_active
+            causal = (cols <= t)
             col_mask = valid & causal
-            # load tiles with mask
-            k = tl.load(k_ptr, mask=col_mask[None, :], other=0.0)
-            qk = tl.sum(q[:, None] * k, axis=0)
-            # set masked columns to -inf before softmax so they contribute zero prob
-            qk = tl.where(col_mask, qk, -float("inf"))
-            m_ij = tl.maximum(m_i, tl.max(qk) * qk_scale)
+            k_ptr = K_full + b * stride_kz + g * stride_kg + cols[None, :] * stride_kn + offs_d[:, None] * stride_kd
+            v_ptr = V_full + b * stride_vz + g * stride_vg + cols[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            k = tl.load(k_ptr, mask=col_mask[None, :], other=0.0).to(tl.float32)
+            qk = tl.sum(k * q[:, None], axis=0)
+            qk = tl.where(col_mask, qk, -1.0e6)
+            max_qk = tl.max(qk)
+            m_ij = tl.maximum(m_i, max_qk * qk_scale)
             qk = qk * qk_scale - m_ij
             p = tl.math.exp2(qk)
             l_ij = tl.sum(p)
             alpha = tl.math.exp2(m_i - m_ij)
             l_i = l_i * alpha + l_ij
             acc = acc * alpha
-            v = tl.load(v_ptr, mask=col_mask[:, None], other=0.0)
+            v = tl.load(v_ptr, mask=col_mask[:, None], other=0.0).to(tl.float32)
             p = p.to(tl.float32)
-            v = v.to(tl.float32)
             acc = acc + tl.sum(v * p[:, None], axis=0)
             m_i = m_ij
-            start_n += BLOCK_N
 
     m_i = m_i + tl.math.log2(l_i)
     acc = acc / l_i
@@ -97,5 +102,3 @@ def select_attention_forward(
     # store per-row max
     m_ptr = M + b * stride_mz + g * stride_mg + t * stride_mt
     tl.store(m_ptr, m_i)
-
-
