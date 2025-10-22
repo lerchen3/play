@@ -1,0 +1,193 @@
+\documentclass[11pt]{article}
+
+% -------- Basics
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{microtype}
+\usepackage{float} % for [H] figure placement
+\usepackage[nameinlink,capitalise]{cleveref}
+
+\setlist[itemize]{leftmargin=1.2em}
+\setlist[enumerate]{leftmargin=1.2em}
+
+% -------- Shortcuts
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\logsumexp}{\operatorname{logsumexp}}
+\newcommand{\R}{\mathbb{R}}
+
+% -------- A tiny helper for dropping figures where you want them
+% Usage: \inlinefig{width}{path}{caption}{label}
+\newcommand{\inlinefig}[4]{%
+  \begin{figure}[H]
+    \centering
+    \includegraphics[width=#1]{#2}
+    \caption{#3}
+    \label{#4}
+  \end{figure}
+}
+
+\title{\textbf{KV merging}}
+\author{Lerchen}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Motivation in one page}
+We build a cache that respects two simple truths about attention:
+\begin{enumerate}
+  \item \textbf{Only relative key displacements matter.} For a fixed query $q$, adding a constant $c$ to \emph{all} keys shifts every logit by $q^\top c$, which cancels inside the softmax. So logits depend on $q^\top (k-\mu_k)$, not the absolute position of $k$. 
+  \item \textbf{Queries are anisotropic.} Some directions have much larger second moment $u^\top\Sigma_q u$ than others
+(eigenvalue spread can exceed $10\times$ in our Llama dumps).
+\end{enumerate}
+We recenter keys, whiten queries, and only merge when we can \emph{certify} an $L_2$ error bound under the empirical query distribution. 
+
+\noindent In particular, for two keys \( k_1, k_2 \), define the discrepancy you actually care about, the squared difference in attention scores:
+\[
+D(k_1, k_2) := \mathbb{E}_q \big[ (q^\top (k_1 - k_2))^2 \big].
+\]
+
+\noindent However, note that 
+\[D(k_1,k_2)=(k_1-k_2)^\top\,\Sigma_q\,(k_1-k_2)
+=\big\|\Sigma_q^{1/2}(k_1-k_2)\big\|_2^2.\]
+
+\noindent Hence, the correct representation of keys that clusters keys in a way that is connected with the \textit{difference} of the attention scores is exactly the whitened key vectors $\tilde k = \E[qq^\top]^{1/2} (k-\mu_k)$. We hence define formally:
+
+\noindent \textbf{Definition.} Let $\Sigma_q=\E[qq^\top]$ (second moment, not the covariance) and let $\mu_k=\E[k]$ within a head. Define
+\[
+\tilde q \;=\; \Sigma_q^{-1/2}q,\qquad 
+\tilde k \;=\; \Sigma_q^{1/2}(k-\mu_k).
+\]
+Then $\E[\tilde q \tilde q^\top]=I$ and
+\[
+\tilde q^\top \tilde k \;=\; q^\top (k-\mu_k).
+\]
+So attention logits can be written entirely in terms of the whitened query and the centered, reweighted key. 
+
+
+\section*{Related work, why we differ}
+KVMerger clusters in the raw space using cosine similarity and merges with a Gaussian weighting once a trigger fires.\footnote{KVMerger: \url{https://arxiv.org/abs/2407.08454}.} It assumes raw directions and absolute positions of keys are the right geometry, and it decides merges with heuristics, then checks quality after decoding. 
+Q-Filters identifies a single query-driven direction and prunes by a projection score without materializing attention.\footnote{Q-Filters: \url{https://arxiv.org/abs/2503.02812}.} 
+
+Our take:
+\begin{itemize}
+  \item Q-filters shows that the first right-vector of the SVD of $Q$ is a very dominant dimension, and that we should evict $k$'s that have smallest dot product with that direction. They justify this by saying that the \textit{keys have high magnitude in that direction}. This is a bad justification - one would want the \textit{variance} of the keys to be high in that dimension to be able to evict the odd $k$'s. We also generalize beyond only considering the right vectors of $Q$ as the dimensions - to find the dimensions that explain the \textit{most variance}, we are doing the best we can do - see next section.
+  \item We choose to fit the quantity we actually care about. For a chunk of keys, we directly fit the merged key so that $\sum e^{q^\top k}$ is preserved in expectation, under the empirical $q$ distribution, and we accept a merge only if its certified error stays below $\epsilon$. 
+  \item KVMerger uses cosine similarity between absolute positions of $k$ as a "similarity" metric many times. However, unlike our metric, this similarity metric does not respect shifts of $k$ and hence there is no reason for this to theoretically work - one could shift all of the $k$'s very very far in one direction, preserving all attention outputs yet making all $k$'s look very "similar", and this paradigm would elect to merge all of the $k$'s together into one $k$, a clear 
+\end{itemize}
+
+\subsection*{Why the spectrum of $S$ is the right guide.}
+
+Let 
+\[
+S \;=\; \Cov(\tilde k)\;=\;\Sigma_q^{1/2}\,\Cov(k)\,\Sigma_q^{1/2}.
+\]
+Consider the centered logit $L(q,k)=\tilde q^\top \tilde k$. Its expected squared magnitude is
+\[
+\E_{q,k}\big[L(q,k)^2\big]
+= \E_q\!\left[\tilde q^\top\,\E_k[\tilde k\tilde k^\top]\,\tilde q\right]
+= \mathrm{Tr}\!\big(S\,\E_q[\tilde q \tilde q^\top]\big)
+= \mathrm{Tr}(S).
+\]
+Projecting $\tilde k$ onto a rank-$r$ subspace with projector $P_r$ captures energy 
+$\E\big[(\tilde q^\top P_r\tilde k)^2\big]=\mathrm{Tr}(P_r S)$. By Ky Fan, choosing the top-$r$ eigenvectors of $S$ maximizes this captured energy; it explains the most variance in attention scores. Empirically the spectrum drops fast: mean $\lambda_1=1.48\times 10^5$ falls to $3.96\times 10^4$ at rank $2$, so most useful logit energy sits in a tiny subspace once we make queries isotropic. We also hence motivate projecting all keys into a lower dimensional subspace consisting of the largest eigenvectors in $S$, via a projector $P_r$.
+
+\subsection*{Learning the projector (optional but helps)}
+We initialize $P_r$ with the top-$r$ eigenvectors of $S$ and then directly minimize the attention reconstruction loss
+\[
+\mathcal{L}_{\text{proj}} \;=\; \frac{1}{|B|}\!
+\sum_{(Q,K,V,O)\in B}\big\|\mathrm{Attn}\!\big(\tilde Q,\,P_r\,\tilde K,\,V\big)-O\big\|_2^2,
+\quad \tilde Q=\Sigma_q^{-1/2}Q,\qquad \tilde K=\Sigma_q^{1/2}(K-\mu_k)
+\]
+On cached DeepSeek batches, $\mathcal{L}_{\text{proj}}$ drops from $3.97\!\times\!10^{-3}$ at $r{=}1$ to $3.89\!\times\!10^{-4}$ at $r{=}64$, while a same-capacity per-head MLP trained on the identical loss stalls at $1.49\!\times\!10^{-2}$. The whitened linear subspace is both expressive and easy to optimize.
+
+\section*{Least-squares merge certificate}
+We merge only when we can certify low distortion under the empirical query distribution. For readability we omit the $\sqrt{d_k}$ terms.
+
+\paragraph{Fitting the merged key (average-preserving).}
+For a temporally contiguous chunk $\mathcal{C}$ and previously seen whitened queries $\{\tilde q_i\}_{i=1}^m$, define the average-of-exponentials target
+\[
+A_i \;=\; \frac{1}{|\mathcal{C}|}\sum_{k\in\mathcal{C}} e^{\tilde q_i^\top \tilde k}
+\quad\Longrightarrow\quad
+y_i \;=\; \log A_i \;=\; \log\!\sum_{k\in\mathcal{C}} e^{\tilde q_i^\top \tilde k} \;-\; \log|\mathcal{C}|.
+\]
+Stack the whitened queries into
+\[
+\mathbf{Q} \;=\;
+\begin{bmatrix}
+\tilde q_1^\top\\[-1pt]\vdots\\[-1pt]\tilde q_m^\top
+\end{bmatrix}.
+\]
+We choose the merged whitened key by the (log-domain) least-squares fit
+\[
+\tilde k_\mathcal{C}
+\;=\;\arg\min_{\tilde k}\big\|\mathbf{Q}\tilde k - y\big\|_2^2
+\;=\;(\mathbf{Q}^\top\!\mathbf{Q})^{\dagger}\mathbf{Q}^\top y.
+\]
+
+\noindent \textit{Remark.} One can approximate the $(\mathbf{Q}^\top\!\mathbf{Q})^{\dagger}$ with $\frac 1m I$ in practice, as $\E [\tilde q \tilde q^t] = I$. 
+\paragraph{Certifying distortion (original exp domain).}
+We certify using the per-query, per-token squared error of the average-preserving approximation:
+\[
+\varepsilon_\mathcal{C} \;=\; \frac{1}{m\,|\mathcal{C}|}\sum_{i=1}^m 
+\left(\sum_{k\in\mathcal{C}} e^{\tilde q_i^\top \tilde k}
+\;-\; |\mathcal{C}|\, e^{\tilde q_i^\top \tilde k_\mathcal{C}}\right)^{\!2},
+\]
+and accept the merge only if $\varepsilon_\mathcal{C}\le\epsilon$.
+
+\section*{Algorithm sketch}
+\begin{enumerate}
+  \item \textbf{Prefill.} Store singleton chunks $(\tilde k, v, 1)$.
+  \item \textbf{Decode at step $t$:}
+  \begin{enumerate}[label*=\arabic*.]
+    \item Project the new key: $\tilde k_t \!=\! P_r\,\Sigma_q^{1/2}(k_t-\mu_k)$, append to the active chunk.
+    \item Recompute $\tilde k_\mathcal{C}$ using the closed form above with
+          $y_i=\log\!\sum_{k\in\mathcal{C}} e^{\tilde q_i^\top \tilde k}-\log|\mathcal C|$;
+          set $v_\mathcal{C}$ to the mean of the values in the chunk.
+    \item If $\varepsilon_\mathcal{C}>\epsilon$, seal the previous chunk and start a new one with $(\tilde k_t,v_t,1)$.
+  \end{enumerate}
+  \item \textbf{Lookup.} Each sealed chunk contributes a single term. We approximate
+  \[
+  \sum_{k\in\mathcal{C}} e^{q^\top k}\,V_k 
+  \;\approx\;
+  |\mathcal C|\,e^{\tilde q^\top \tilde k_\mathcal{C}}\cdot \bar v_\mathcal{C},
+  \qquad
+  \sum_{k\in\mathcal{C}} e^{q^\top k}
+  \;\approx\;
+  |\mathcal C|\,e^{\tilde q^\top \tilde k_\mathcal{C}},
+  \]
+  so keys and values share the same compression factor. Each chunk stores $(\tilde k_\mathcal{C},\,\bar v_\mathcal{C},\,|\mathcal{C}|)$.
+\end{enumerate}
+
+\section*{Snapshot of current evidence}
+Using DeepSeek-R1 dumps:
+\begin{itemize}
+  \item In practice, it seems that actually using:
+
+  \[
+  \sum_{k\in\mathcal{C}} e^{q^\top k}\,V_k 
+  \;\to\;
+  \,e^{\tilde q^\top \tilde k_\mathcal{C}}\cdot \bar v_\mathcal{C},
+  \qquad
+  \sum_{k\in\mathcal{C}} e^{q^\top k}
+  \;\to\;
+  \,e^{\tilde q^\top \tilde k_\mathcal{C}},
+  \]
+
+  works better than scaling by these by $|\mathcal C|$ (i.e. when you do attention, you literally just have a cache of . This is surprising as this now does not resemble attention and does not attempt to get close to the numerator or denominator.
+\end{itemize}
+
+\subsection*{Appendix: AI use}
+AI generated most of the code written in the Github repository, as well as most of the latex in the first edition of this document.
+
+\noindent I had to fix many implementation bugs where the math got into the weeds, such as the least squares calculation and the low rank projection matmuls. I also had to replace much of the motivation and some of the math in this document with my own language; I hope that it reads more naturally and intuitively after this edit. Much "intuition" blabber in the first document was quite wrong.
+\end{document}
+

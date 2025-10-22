@@ -1,0 +1,14 @@
+__pycache__/
+results/
+.venv/
+.vscode/
+.idea/
+*.egg-info/
+# PyTorch checkpoints and model files
+*.pt
+*.json
+*.csv
+dumps/
+
+# External git submodule (qfilters baseline)
+qfilters/
